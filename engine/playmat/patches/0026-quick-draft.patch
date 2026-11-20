@@ -1,0 +1,3628 @@
+diff --git a/Mage.Server/pom.xml b/Mage.Server/pom.xml
+index 13a7af9fbe..e6e4f19ca3 100644
+--- a/Mage.Server/pom.xml
++++ b/Mage.Server/pom.xml
+@@ -538,6 +538,11 @@
+                                 <class>mage.server.career.CareerLimited$ColorSignal</class>
+                                 <class>mage.server.career.CareerLimited$PairAdvice</class>
+                                 <class>mage.server.career.CareerLimited$CareerLimitedCoach</class>
++                                <class>mage.server.career.QuickDraft$QuickDraftState</class>
++                                <class>mage.server.career.QuickDraft$QuickDraftRun</class>
++                                <class>mage.server.career.QuickDraft$QuickDraftBrain</class>
++                                <class>mage.server.career.QuickDraft$QuickDraftBot</class>
++                                <class>mage.server.career.QuickDraft$QuickDraftGame</class>
+                             </classes>
+                         </configuration>
+                     </plugin>
+diff --git a/Mage.Server/src/main/java/mage/server/TableController.java b/Mage.Server/src/main/java/mage/server/TableController.java
+index 128fa1f4a8..187c295439 100644
+--- a/Mage.Server/src/main/java/mage/server/TableController.java
++++ b/Mage.Server/src/main/java/mage/server/TableController.java
+@@ -927,6 +927,15 @@ public class TableController {
+                 }
+             }
+         }
++        if (mage.server.career.QuickDraft.get().isQuickDraftTable(table.getId()) && match.hasEnded()) {
++            // mtg-ai: a quick draft game counts for its run
++            for (MatchPlayer matchPlayer : match.getPlayers()) {
++                if (matchPlayer.getPlayer().isHuman()) {
++                    mage.server.career.QuickDraft.get().matchEnded(table.getId(), matchPlayer.isMatchWinner(), game.getTurnNum());
++                    break;
++                }
++            }
++        }
+         if (mage.server.solo.GhostDecks.get().marked(table.getId()) && match.hasEnded()) {
+             // a ghost deck's owner hears how their deck did (S047)
+             for (MatchPlayer matchPlayer : match.getPlayers()) {
+diff --git a/Mage.Server/src/main/java/mage/server/career/CareerLimited.java b/Mage.Server/src/main/java/mage/server/career/CareerLimited.java
+index 2e46e77bf9..d618f04bf3 100644
+--- a/Mage.Server/src/main/java/mage/server/career/CareerLimited.java
++++ b/Mage.Server/src/main/java/mage/server/career/CareerLimited.java
+@@ -866,7 +866,7 @@ public final class CareerLimited {
+         BASIC_NAMES.put('G', "Forest");
+     }
+ 
+-    private static CareerPoolCard basic(char color) {
++    static CareerPoolCard basic(char color) {
+         CareerPoolCard card = new CareerPoolCard();
+         card.name = BASIC_NAMES.get(color);
+         card.rarity = CareerRules.LAND;
+diff --git a/Mage.Server/src/main/java/mage/server/career/QuickDraft.java b/Mage.Server/src/main/java/mage/server/career/QuickDraft.java
+new file mode 100644
+index 0000000000..f02f49435d
+--- /dev/null
++++ b/Mage.Server/src/main/java/mage/server/career/QuickDraft.java
+@@ -0,0 +1,904 @@
++package mage.server.career;
++
++import com.google.gson.Gson;
++import com.google.gson.GsonBuilder;
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++import mage.cards.Card;
++import mage.cards.ExpansionSet;
++import mage.cards.Sets;
++import mage.cards.decks.DeckCardInfo;
++import mage.cards.decks.DeckCardLists;
++import org.apache.log4j.Logger;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.HttpURLConnection;
++import java.net.URL;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.StandardOpenOption;
++import java.time.LocalDate;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * mtg-ai: Quick Draft, like MTG Arena's. You and seven bots draft three packs of a set; each bot seat picks with its own
++ * "brain" (statistical-drafting, DraftFM, 17lands win rates or XMage's ratings) from the draft-brain service
++ * (play/draft_brain in mtg-ai, -Dmtgai.draftBrainPort, default 17190), and builds its deck there too. Then you play Bo1
++ * games against the bots' decks, piloted by the Claude AI or the Playmat AI, until seven wins or three losses.
++ *
++ * No Career profile, coins or collection: a run is a folder under the draft directory (-Dmtgai.draftDir, default
++ * ~/mtg-data/playmat-drafts), <date>/<run id>/, holding run.json (the whole run), picks.jsonl (every pick of every seat:
++ * the pack before the pick, the card taken, the seat's brain and its scores), decks.json (the eight decks) and
++ * games.jsonl (each game's opponent and result). active/<user> names a player's run in progress. When the brain service
++ * doesn't answer, a bot picks and builds like Career Limited's bots, and the pick log says so.
++ */
++public final class QuickDraft {
++
++    private static final Logger logger = Logger.getLogger(QuickDraft.class);
++    private static final Gson gson = new Gson();
++    private static final Gson pretty = new GsonBuilder().setPrettyPrinting().create();
++    public static final int WINS = 7;
++    public static final int LOSSES = 3;
++    public static final List<String> SETS = Arrays.asList("DSK", "FDN");
++    public static final String DEFAULT_BRAIN = "statdraft";
++
++    private static volatile QuickDraft instance;
++
++    private final Path root;
++    private final int brainPort;
++    /** quick draft tables in play: table id -> run, to count the result when the match ends */
++    private final Map<UUID, Seated> tables = new ConcurrentHashMap<>();
++
++    private static class Seated {
++        String user;
++        String runId;
++        int seat;
++    }
++
++    // ---- state
++
++    /** the whole run, kept as run.json */
++    static class Run {
++        String id;
++        String user;
++        String setCode;
++        String setName;
++        /** "draft", "build", "play", or how it ended: "won", "lost", "abandoned" */
++        String phase;
++        long started;
++        long ended;
++        String dir;
++        /** each bot seat's brain, seats 1-7 (index 0 is the player and unused) */
++        List<String> brains = new ArrayList<>();
++        /** who pilots the bots' decks: "claude" or "mad" (the Playmat AI) */
++        String pilot = "claude";
++        /** the Claude seat's model and effort, as the client encodes them (aiSetup.claudeSkill) */
++        int claudeSkill = 1;
++        int wins;
++        int losses;
++        List<CareerLimited.CareerPoolCard> pool = new ArrayList<>();
++        List<DeckCardInfo> deck;
++        CareerLimited.Draft draft;
++        /** the seat-0 pack at each pick of the current round, for what wheeled */
++        Map<Integer, List<String>> seen = new LinkedHashMap<>();
++        /** the player's pick at each pick of the current round */
++        Map<Integer, String> mine = new LinkedHashMap<>();
++        List<CareerLimited.PickRecord> picks = new ArrayList<>();
++        Map<String, Double> passed = new LinkedHashMap<>();
++        /** the bots' decks, seats 1-7 */
++        List<QuickDraftBot> opponents = new ArrayList<>();
++        List<QuickDraftGame> games = new ArrayList<>();
++        /** the table of the game being played, if any */
++        String tableId;
++    }
++
++    public static class QuickDraftBot {
++        public int seat;
++        public String name;
++        public String brain;
++        public String colors;
++        /** "brain" when the service built it, "fallback" when Career's builder did */
++        public String builtBy;
++        public List<CareerLimited.CareerPoolCard> cards = new ArrayList<>();
++    }
++
++    public static class QuickDraftGame {
++        public int number;
++        public String tableId;
++        public int seat;
++        public String opponent;
++        public String brain;
++        public String colors;
++        public String pilot;
++        public boolean won;
++        public int turns;
++        public long ended;
++    }
++
++    // ---- views
++
++    public static class QuickDraftRun extends CareerLimited.CareerLimitedRun {
++        public List<String> brains;
++        public String pilot;
++        public int claudeSkill;
++        /** cards in the pack now that were in it when it last came to you: they went all the way round */
++        public List<String> wheeled;
++        /** cards that were in the pack when it last came to you and were taken since (yours excepted) */
++        public List<String> takenSince;
++        public List<QuickDraftGame> games;
++        /** the next opponent: its seat, brain and colours */
++        public QuickDraftBot next;
++        public long started;
++    }
++
++    public static class QuickDraftBrain {
++        public String name;
++        public String label;
++    }
++
++    public static class QuickDraftState {
++        public QuickDraftRun run;
++        public List<QuickDraftRun> recent = new ArrayList<>();
++        public List<QuickDraftBrain> brains = new ArrayList<>();
++        public String defaultBrain = DEFAULT_BRAIN;
++        public List<String> sets = SETS;
++        /** whether the draft-brain service answered; without it every bot uses the fallback */
++        public boolean brainService;
++    }
++
++    public static class QuickDraftException extends Exception {
++        public QuickDraftException(String message) {
++            super(message);
++        }
++    }
++
++    private QuickDraft() {
++        String dir = System.getProperty("mtgai.draftDir");
++        root = dir != null && !dir.isEmpty() ? Paths.get(dir) : Paths.get(System.getProperty("user.home"), "mtg-data", "playmat-drafts");
++        brainPort = Integer.getInteger("mtgai.draftBrainPort", 17190);
++    }
++
++    public static QuickDraft get() {
++        QuickDraft current = instance;
++        if (current == null) {
++            synchronized (QuickDraft.class) {
++                current = instance;
++                if (current == null) {
++                    current = new QuickDraft();
++                    instance = current;
++                }
++            }
++        }
++        return current;
++    }
++
++    // ---- storage
++
++    private Path activeFile(String user) {
++        return root.resolve("active").resolve(safe(user));
++    }
++
++    private static String safe(String user) {
++        return user.replaceAll("[^A-Za-z0-9._-]", "_");
++    }
++
++    private synchronized Run active(String user) {
++        try {
++            Path file = activeFile(user);
++            if (!Files.exists(file)) {
++                return null;
++            }
++            Path dir = root.resolve(new String(Files.readAllBytes(file), StandardCharsets.UTF_8).trim());
++            Run run = gson.fromJson(new String(Files.readAllBytes(dir.resolve("run.json")), StandardCharsets.UTF_8), Run.class);
++            return run != null && isOpen(run) ? run : null;
++        } catch (IOException | RuntimeException e) {
++            logger.warn("Quick draft: can't read " + user + "'s run: " + e.getMessage());
++            return null;
++        }
++    }
++
++    private static boolean isOpen(Run run) {
++        return "draft".equals(run.phase) || "build".equals(run.phase) || "play".equals(run.phase);
++    }
++
++    private synchronized void save(Run run) {
++        try {
++            Path dir = root.resolve(run.dir);
++            Files.createDirectories(dir);
++            Path tmp = dir.resolve("run.json.tmp");
++            Files.write(tmp, pretty.toJson(run).getBytes(StandardCharsets.UTF_8));
++            Files.move(tmp, dir.resolve("run.json"), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
++            Path active = activeFile(run.user);
++            Files.createDirectories(active.getParent());
++            if (isOpen(run)) {
++                Files.write(active, run.dir.getBytes(StandardCharsets.UTF_8));
++            } else {
++                Files.deleteIfExists(active);
++            }
++        } catch (IOException e) {
++            logger.error("Quick draft: can't save run " + run.id, e);
++        }
++    }
++
++    private void append(Run run, String file, Object line) {
++        try {
++            Path dir = root.resolve(run.dir);
++            Files.createDirectories(dir);
++            Files.write(dir.resolve(file), (gson.toJson(line) + "\n").getBytes(StandardCharsets.UTF_8),
++                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
++        } catch (IOException e) {
++            logger.error("Quick draft: can't write " + file + " of run " + run.id, e);
++        }
++    }
++
++    private List<Run> recent(String user) {
++        List<Run> runs = new ArrayList<>();
++        try (java.util.stream.Stream<Path> dates = Files.exists(root) ? Files.list(root) : java.util.stream.Stream.empty()) {
++            List<Path> days = new ArrayList<>();
++            dates.filter(p -> p.getFileName().toString().matches("\\d{4}-\\d{2}-\\d{2}")).forEach(days::add);
++            days.sort(Collections.reverseOrder());
++            for (Path day : days) {
++                try (java.util.stream.Stream<Path> ids = Files.list(day)) {
++                    for (Path dir : (Iterable<Path>) ids::iterator) {
++                        Path file = dir.resolve("run.json");
++                        if (!Files.exists(file)) {
++                            continue;
++                        }
++                        Run run = gson.fromJson(new String(Files.readAllBytes(file), StandardCharsets.UTF_8), Run.class);
++                        if (run != null && user.equals(run.user) && !isOpen(run)) {
++                            runs.add(run);
++                        }
++                    }
++                }
++                if (runs.size() >= 10) {
++                    break;
++                }
++            }
++        } catch (IOException | RuntimeException e) {
++            logger.warn("Quick draft: can't list runs: " + e.getMessage());
++        }
++        runs.sort((a, b) -> Long.compare(b.started, a.started));
++        return runs.size() > 10 ? runs.subList(0, 10) : runs;
++    }
++
++    // ---- the brain service
++
++    /** one request to the brain service: the answer's JSON, or null when it isn't there or fails */
++    private String http(String method, String path, String body, int timeoutMs) {
++        HttpURLConnection connection = null;
++        try {
++            connection = (HttpURLConnection) new URL("http://127.0.0.1:" + brainPort + path).openConnection();
++            connection.setRequestMethod(method);
++            connection.setConnectTimeout(2000);
++            connection.setReadTimeout(timeoutMs);
++            if (body != null) {
++                connection.setDoOutput(true);
++                connection.setRequestProperty("Content-Type", "application/json");
++                try (OutputStream out = connection.getOutputStream()) {
++                    out.write(body.getBytes(StandardCharsets.UTF_8));
++                }
++            }
++            int status = connection.getResponseCode();
++            try (InputStream in = status == 200 ? connection.getInputStream() : connection.getErrorStream()) {
++                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++                byte[] buffer = new byte[8192];
++                for (int n; in != null && (n = in.read(buffer)) > 0; ) {
++                    bytes.write(buffer, 0, n);
++                }
++                String text = new String(bytes.toByteArray(), StandardCharsets.UTF_8);
++                if (status != 200) {
++                    logger.warn("Quick draft: brain " + path + " answered " + status + ": " + text);
++                    return null;
++                }
++                return text;
++            }
++        } catch (IOException | RuntimeException e) {
++            logger.warn("Quick draft: brain service unreachable (" + path + "): " + e.getMessage());
++            return null;
++        } finally {
++            if (connection != null) {
++                connection.disconnect();
++            }
++        }
++    }
++
++    private JsonObject callBrain(String path, JsonObject body) {
++        String text = http("POST", path, body.toString(), path.equals("/build") ? 10000 : 3000);
++        try {
++            return text == null ? null : new JsonParser().parse(text).getAsJsonObject();
++        } catch (RuntimeException e) {
++            logger.warn("Quick draft: brain " + path + " answered something unreadable: " + e.getMessage());
++            return null;
++        }
++    }
++
++    public List<QuickDraftBrain> brains() {
++        List<QuickDraftBrain> out = new ArrayList<>();
++        String text = http("GET", "/brains", null, 2000);
++        if (text == null) {
++            return out;
++        }
++        try {
++            for (JsonElement element : new JsonParser().parse(text).getAsJsonObject().getAsJsonArray("brains")) {
++                QuickDraftBrain brain = new QuickDraftBrain();
++                brain.name = element.getAsJsonObject().get("name").getAsString();
++                brain.label = element.getAsJsonObject().get("label").getAsString();
++                out.add(brain);
++            }
++        } catch (RuntimeException e) {
++            logger.warn("Quick draft: brain list unreadable: " + e.getMessage());
++        }
++        return out;
++    }
++
++    private static JsonArray names(List<CareerLimited.CareerPoolCard> cards) {
++        JsonArray array = new JsonArray();
++        for (CareerLimited.CareerPoolCard card : cards) {
++            array.add(card.name);
++        }
++        return array;
++    }
++
++    private static List<String> nameList(List<CareerLimited.CareerPoolCard> cards) {
++        List<String> list = new ArrayList<>();
++        for (CareerLimited.CareerPoolCard card : cards) {
++            list.add(card.name);
++        }
++        return list;
++    }
++
++    /** a bot's pick: the index into its pack, from its brain or, failing that, Career's bot */
++    private int botPick(Run run, int seat, List<CareerLimited.CareerPoolCard> pack, List<CareerLimited.CareerPoolCard> pool, Map<String, Object> log) {
++        String brain = run.brains.get(seat);
++        log.put("brain", brain);
++        if (!"xmage".equals(brain)) {
++            JsonObject body = new JsonObject();
++            body.addProperty("set", run.setCode);
++            body.addProperty("brain", brain);
++            body.add("pack", names(pack));
++            body.add("pool", names(pool));
++            body.addProperty("pack_number", run.draft.round - 1);
++            body.addProperty("pick_number", run.draft.pick - 1);
++            JsonObject answer = callBrain("/pick", body);
++            if (answer != null && answer.has("pick") && !answer.get("pick").isJsonNull()) {
++                String name = answer.get("pick").getAsString();
++                for (int i = 0; i < pack.size(); i++) {
++                    if (pack.get(i).name.equals(name)) {
++                        log.put("source", "brain");
++                        if (answer.has("scores")) {
++                            log.put("scores", gson.fromJson(answer.get("scores"), List.class));
++                        }
++                        return i;
++                    }
++                }
++            }
++            log.put("source", answer == null ? "fallback:unreachable" : "fallback:no-pick");
++        } else {
++            log.put("source", "xmage");
++        }
++        return CareerLimited.get().botPick(pack, pool);
++    }
++
++    private QuickDraftBot botDeck(Run run, int seat, List<CareerLimited.CareerPoolCard> pool) {
++        QuickDraftBot deck = new QuickDraftBot();
++        deck.seat = seat;
++        deck.brain = run.brains.get(seat);
++        deck.name = "Bot " + seat;
++        JsonObject body = new JsonObject();
++        body.addProperty("set", run.setCode);
++        body.add("pool", names(pool));
++        JsonObject answer = "xmage".equals(deck.brain) ? null : callBrain("/build", body);
++        if (answer != null && answer.has("main")) {
++            List<CareerLimited.CareerPoolCard> left = new ArrayList<>(pool);
++            for (JsonElement element : answer.getAsJsonArray("main")) {
++                String name = element.getAsString();
++                for (int i = 0; i < left.size(); i++) {
++                    if (left.get(i).name.equals(name)) {
++                        deck.cards.add(left.remove(i));
++                        break;
++                    }
++                }
++            }
++            for (Map.Entry<String, JsonElement> land : answer.getAsJsonObject("lands").entrySet()) {
++                char color = "Plains".equals(land.getKey()) ? 'W' : "Island".equals(land.getKey()) ? 'U' : "Swamp".equals(land.getKey()) ? 'B'
++                        : "Mountain".equals(land.getKey()) ? 'R' : 'G';
++                for (int n = 0; n < land.getValue().getAsInt(); n++) {
++                    deck.cards.add(CareerLimited.basic(color));
++                }
++            }
++            deck.colors = answer.has("colors") ? answer.get("colors").getAsString() : CareerLimited.mainColors(pool);
++            deck.builtBy = "brain";
++        }
++        if (deck.cards.size() < CareerLimited.DECK_SIZE) {
++            deck.cards = CareerLimited.build(pool);
++            deck.colors = CareerLimited.mainColors(pool);
++            deck.builtBy = "fallback";
++        }
++        return deck;
++    }
++
++    // ---- the run
++
++    public QuickDraftState state(String user) {
++        QuickDraftState state = new QuickDraftState();
++        state.brains = brains();
++        state.brainService = !state.brains.isEmpty();
++        Run run = active(user);
++        state.run = run == null ? null : view(run);
++        for (Run done : recent(user)) {
++            QuickDraftRun view = view(done);
++            view.pool = null;
++            view.deck = null;
++            view.picks = null;
++            state.recent.add(view);
++        }
++        return state;
++    }
++
++    public QuickDraftRun start(String user, String setCode, List<String> brains, String pilot, int claudeSkill) throws QuickDraftException {
++        if (active(user) != null) {
++            throw new QuickDraftException("You have a quick draft going already: finish or abandon it first.");
++        }
++        String code = setCode == null ? "" : setCode.toUpperCase();
++        ExpansionSet set = Sets.findSet(code);
++        if (!SETS.contains(code) || set == null) {
++            throw new QuickDraftException("Quick draft offers " + String.join(" and ", SETS) + ".");
++        }
++        Run run = new Run();
++        run.id = UUID.randomUUID().toString();
++        run.user = user;
++        run.setCode = code;
++        run.setName = set.getName();
++        run.started = System.currentTimeMillis();
++        run.dir = LocalDate.now() + "/" + run.id;
++        run.pilot = "mad".equals(pilot) ? "mad" : "claude";
++        run.claudeSkill = Math.max(1, claudeSkill);
++        run.brains.add("");
++        for (int seat = 1; seat < CareerLimited.SEATS; seat++) {
++            String brain = brains == null || brains.isEmpty() ? DEFAULT_BRAIN : brains.get(Math.min(seat - 1, brains.size() - 1));
++            run.brains.add(brain == null || brain.isEmpty() ? DEFAULT_BRAIN : brain);
++        }
++        run.draft = newDraft(code);
++        if (run.draft.packs.get(0).isEmpty()) {
++            throw new QuickDraftException(run.setName + " has no boosters on this server.");
++        }
++        run.phase = "draft";
++        noteSeen(run);
++        save(run);
++        logger.info("Quick draft: " + user + " started " + code + " (" + run.id + "), bots " + run.brains.subList(1, run.brains.size()) + ", pilot " + run.pilot);
++        return view(run);
++    }
++
++    private static CareerLimited.Draft newDraft(String setCode) {
++        CareerLimited.Draft draft = new CareerLimited.Draft();
++        for (int seat = 0; seat < CareerLimited.SEATS; seat++) {
++            draft.packs.add(booster(setCode));
++            draft.pools.add(new ArrayList<>());
++        }
++        return draft;
++    }
++
++    private static List<CareerLimited.CareerPoolCard> booster(String setCode) {
++        List<CareerLimited.CareerPoolCard> pack = new ArrayList<>();
++        ExpansionSet set = Sets.findSet(setCode);
++        if (set != null) {
++            for (Card card : set.createBooster()) {
++                pack.add(CareerLimited.poolCard(card));
++            }
++        }
++        return pack;
++    }
++
++    private static void noteSeen(Run run) {
++        if (run.draft != null) {
++            run.seen.put(run.draft.pick, nameList(run.draft.packs.get(0)));
++        }
++    }
++
++    public synchronized QuickDraftRun pick(String user, int index) throws QuickDraftException {
++        Run run = active(user);
++        if (run == null) {
++            throw new QuickDraftException("You have no quick draft going.");
++        }
++        if (!"draft".equals(run.phase) || run.draft == null) {
++            throw new QuickDraftException("The draft is over.");
++        }
++        CareerLimited.Draft draft = run.draft;
++        List<CareerLimited.CareerPoolCard> mine = draft.packs.get(0);
++        if (index < 0 || index >= mine.size()) {
++            throw new QuickDraftException("That card isn't in the pack.");
++        }
++        long now = System.currentTimeMillis();
++        CareerLimited.notePassed(run.passed, mine, draft.pick);
++        run.picks.add(CareerLimited.grade(mine, index, draft.pools.get(0), draft.round, draft.pick));
++        append(run, "picks.jsonl", pickLine(run, 0, "human:" + user, mine, index, draft.pools.get(0), null, now));
++        run.mine.put(draft.pick, mine.get(index).name);
++        draft.pools.get(0).add(mine.remove(index));
++        for (int seat = 1; seat < CareerLimited.SEATS; seat++) {
++            List<CareerLimited.CareerPoolCard> pack = draft.packs.get(seat);
++            if (pack.isEmpty()) {
++                continue;
++            }
++            Map<String, Object> log = new LinkedHashMap<>();
++            int taken = botPick(run, seat, pack, draft.pools.get(seat), log);
++            append(run, "picks.jsonl", pickLine(run, seat, "bot", pack, taken, draft.pools.get(seat), log, now));
++            draft.pools.get(seat).add(pack.remove(taken));
++        }
++        // packs pass left, right, left
++        Collections.rotate(draft.packs, draft.round % 2 == 1 ? 1 : -1);
++        draft.pick++;
++        if (draft.packs.get(0).isEmpty()) {
++            if (draft.round < CareerLimited.DRAFT_PACKS) {
++                draft.round++;
++                draft.pick = 1;
++                run.seen.clear();
++                run.mine.clear();
++                for (int seat = 0; seat < CareerLimited.SEATS; seat++) {
++                    draft.packs.set(seat, booster(run.setCode));
++                }
++            } else {
++                finishDraft(run);
++            }
++        }
++        if ("draft".equals(run.phase)) {
++            noteSeen(run);
++        }
++        save(run);
++        return view(run);
++    }
++
++    private Map<String, Object> pickLine(Run run, int seat, String who, List<CareerLimited.CareerPoolCard> pack, int index,
++                                         List<CareerLimited.CareerPoolCard> pool, Map<String, Object> bot, long now) {
++        Map<String, Object> line = new LinkedHashMap<>();
++        line.put("run", run.id);
++        line.put("set", run.setCode);
++        line.put("pack", run.draft.round);
++        line.put("pick", run.draft.pick);
++        line.put("seat", seat);
++        line.put("who", who);
++        List<String> printings = new ArrayList<>();
++        for (CareerLimited.CareerPoolCard card : pack) {
++            printings.add(card.setCode + ":" + card.cardNumber);
++        }
++        line.put("cards", nameList(pack));
++        line.put("printings", printings);
++        line.put("picked", pack.get(index).name);
++        line.put("pool", nameList(pool));
++        if (bot != null) {
++            line.putAll(bot);
++        }
++        line.put("ts", now);
++        return line;
++    }
++
++    private void finishDraft(Run run) {
++        run.pool = run.draft.pools.get(0);
++        Map<String, Object> decks = new LinkedHashMap<>();
++        for (int seat = 1; seat < CareerLimited.SEATS; seat++) {
++            QuickDraftBot deck = botDeck(run, seat, run.draft.pools.get(seat));
++            run.opponents.add(deck);
++            Map<String, Object> entry = new LinkedHashMap<>();
++            entry.put("brain", deck.brain);
++            entry.put("built_by", deck.builtBy);
++            entry.put("colors", deck.colors);
++            entry.put("deck", nameList(deck.cards));
++            entry.put("pool", nameList(run.draft.pools.get(seat)));
++            decks.put("seat" + seat, entry);
++        }
++        Map<String, Object> human = new LinkedHashMap<>();
++        human.put("who", "human:" + run.user);
++        human.put("pool", nameList(run.pool));
++        decks.put("seat0", human);
++        try {
++            Files.write(root.resolve(run.dir).resolve("decks.json"), pretty.toJson(decks).getBytes(StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            logger.error("Quick draft: can't write decks of run " + run.id, e);
++        }
++        run.draft = null;
++        run.seen.clear();
++        run.phase = "build";
++    }
++
++    public CareerLimited.CareerLimitedCoach coach(String user) throws QuickDraftException {
++        Run run = active(user);
++        if (run == null) {
++            throw new QuickDraftException("You have no quick draft going.");
++        }
++        if ("draft".equals(run.phase)) {
++            throw new QuickDraftException("Finish the draft first.");
++        }
++        return CareerLimited.coach(run.pool);
++    }
++
++    public synchronized QuickDraftRun submitDeck(String user, DeckCardLists deck) throws QuickDraftException {
++        Run run = active(user);
++        if (run == null) {
++            throw new QuickDraftException("You have no quick draft going.");
++        }
++        if ("draft".equals(run.phase)) {
++            throw new QuickDraftException("Finish the draft first.");
++        }
++        int size = deck.getCards().stream().mapToInt(DeckCardInfo::getAmount).sum();
++        if (size < CareerLimited.DECK_SIZE) {
++            throw new QuickDraftException("A limited deck needs at least " + CareerLimited.DECK_SIZE + " cards; this one has " + size + ".");
++        }
++        Map<String, Integer> available = new LinkedHashMap<>();
++        for (CareerLimited.CareerPoolCard card : run.pool) {
++            available.merge(card.name, 1, Integer::sum);
++        }
++        Map<String, Integer> used = new LinkedHashMap<>();
++        for (DeckCardInfo card : deck.getCards()) {
++            if (!CareerService.isBasic(card.getCardName())) {
++                used.merge(card.getCardName(), card.getAmount(), Integer::sum);
++            }
++        }
++        for (Map.Entry<String, Integer> entry : used.entrySet()) {
++            int have = available.getOrDefault(entry.getKey(), 0);
++            if (entry.getValue() > have) {
++                throw new QuickDraftException(entry.getKey() + ": " + entry.getValue() + " in the deck, " + have + " in your pool.");
++            }
++        }
++        run.deck = new ArrayList<>(deck.getCards());
++        run.phase = "play";
++        Map<String, Object> line = new LinkedHashMap<>();
++        line.put("event", "deck");
++        line.put("games_played", run.wins + run.losses);
++        List<String> cards = new ArrayList<>();
++        for (DeckCardInfo card : run.deck) {
++            for (int n = 0; n < card.getAmount(); n++) {
++                cards.add(card.getCardName());
++            }
++        }
++        line.put("deck", cards);
++        line.put("ts", System.currentTimeMillis());
++        append(run, "games.jsonl", line);
++        save(run);
++        return view(run);
++    }
++
++    public synchronized QuickDraftRun setPilot(String user, String pilot, int claudeSkill) throws QuickDraftException {
++        Run run = active(user);
++        if (run == null) {
++            throw new QuickDraftException("You have no quick draft going.");
++        }
++        run.pilot = "mad".equals(pilot) ? "mad" : "claude";
++        run.claudeSkill = Math.max(1, claudeSkill);
++        save(run);
++        return view(run);
++    }
++
++    public synchronized QuickDraftRun abandon(String user) throws QuickDraftException {
++        Run run = active(user);
++        if (run == null) {
++            throw new QuickDraftException("You have no quick draft going.");
++        }
++        run.phase = "abandoned";
++        run.ended = System.currentTimeMillis();
++        save(run);
++        return view(run);
++    }
++
++    /** What the next game needs. */
++    public static class Plan {
++        public String runId;
++        public int seat;
++        public String opponentName;
++        public String pilot;
++        public int claudeSkill;
++        public DeckCardLists playerDeck;
++        public DeckCardLists opponentDeck;
++    }
++
++    public Plan plan(String user) throws QuickDraftException {
++        Run run = active(user);
++        if (run == null) {
++            throw new QuickDraftException("You have no quick draft going.");
++        }
++        if (!"play".equals(run.phase) || run.deck == null) {
++            throw new QuickDraftException("Build your deck first.");
++        }
++        QuickDraftBot bot = nextOpponent(run);
++        Plan plan = new Plan();
++        plan.runId = run.id;
++        plan.seat = bot.seat;
++        plan.pilot = run.pilot;
++        plan.claudeSkill = run.claudeSkill;
++        plan.opponentName = ("claude".equals(run.pilot) ? "Claude" : "Bot") + " " + bot.seat + " " + (bot.colors == null ? "" : bot.colors);
++        plan.playerDeck = new DeckCardLists();
++        plan.playerDeck.setName(run.setCode + " quick draft");
++        for (DeckCardInfo card : run.deck) {
++            plan.playerDeck.getCards().add(CareerLimited.withPrinting(card));
++        }
++        plan.opponentDeck = new DeckCardLists();
++        plan.opponentDeck.setName("Bot " + bot.seat + " (" + bot.brain + ")");
++        Map<String, Integer> counts = new LinkedHashMap<>();
++        Map<String, CareerLimited.CareerPoolCard> byKey = new LinkedHashMap<>();
++        for (CareerLimited.CareerPoolCard card : bot.cards) {
++            String key = card.name + "|" + card.setCode + "|" + card.cardNumber;
++            counts.merge(key, 1, Integer::sum);
++            byKey.put(key, card);
++        }
++        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
++            CareerLimited.CareerPoolCard card = byKey.get(entry.getKey());
++            plan.opponentDeck.getCards().add(CareerLimited.withPrinting(new DeckCardInfo(card.name, card.cardNumber, card.setCode, entry.getValue())));
++        }
++        return plan;
++    }
++
++    /** the pod in order, round and round: game n meets seat (n mod 7) + 1 */
++    private static QuickDraftBot nextOpponent(Run run) {
++        return run.opponents.get((run.wins + run.losses) % run.opponents.size());
++    }
++
++    public void register(UUID tableId, String user, String runId, int seat) {
++        Seated seated = new Seated();
++        seated.user = user;
++        seated.runId = runId;
++        seated.seat = seat;
++        tables.put(tableId, seated);
++        Run run = active(user);
++        if (run != null && run.id.equals(runId)) {
++            synchronized (this) {
++                run.tableId = tableId.toString();
++                save(run);
++            }
++        }
++    }
++
++    /**
++     * A quick draft table's link to its run ("user|run id|seat"), kept with the table's save so a game carried on at
++     * a new table (a take-back, a kept game resumed) still counts for the run; null for other tables.
++     */
++    public String linkOf(UUID tableId) {
++        Seated seated = tableId == null ? null : tables.get(tableId);
++        return seated == null ? null : seated.user + "|" + seated.runId + "|" + seated.seat;
++    }
++
++    /** the table no longer plays for its run (its game carries on at another table): its end counts for nothing */
++    public void forget(UUID tableId) {
++        if (tableId != null && tables.remove(tableId) != null) {
++            logger.info("Quick draft: table " + tableId + " carries on elsewhere; its end won't count");
++        }
++    }
++
++    /** a new table carries on a quick draft game (linkOf of the old one): its result counts for the run */
++    public void adopt(UUID tableId, String link) {
++        String[] parts = link == null ? new String[0] : link.split("\\|");
++        if (tableId == null || parts.length != 3) {
++            return;
++        }
++        try {
++            register(tableId, parts[0], parts[1], Integer.parseInt(parts[2]));
++            logger.info("Quick draft: table " + tableId + " carries on run " + parts[1] + "'s game");
++        } catch (NumberFormatException e) {
++            logger.warn("Quick draft: bad table link " + link);
++        }
++    }
++
++    public boolean isQuickDraftTable(UUID tableId) {
++        return tables.containsKey(tableId);
++    }
++
++    /** a quick draft match ended (TableController): count it, and end the run at seven wins or three losses */
++    public synchronized void matchEnded(UUID tableId, boolean won, int turns) {
++        Seated seated = tables.remove(tableId);
++        if (seated == null) {
++            return;
++        }
++        Run run = active(seated.user);
++        if (run == null || !run.id.equals(seated.runId) || !"play".equals(run.phase)) {
++            return;
++        }
++        QuickDraftBot bot = run.opponents.get(seated.seat - 1);
++        QuickDraftGame result = new QuickDraftGame();
++        result.number = run.wins + run.losses + 1;
++        result.tableId = tableId.toString();
++        result.seat = seated.seat;
++        result.opponent = bot.name;
++        result.brain = bot.brain;
++        result.colors = bot.colors;
++        result.pilot = run.pilot;
++        result.won = won;
++        result.turns = turns;
++        result.ended = System.currentTimeMillis();
++        run.games.add(result);
++        if (won) {
++            run.wins++;
++        } else {
++            run.losses++;
++        }
++        run.tableId = null;
++        Map<String, Object> line = new LinkedHashMap<>();
++        line.put("event", "game");
++        line.put("number", result.number);
++        line.put("tableId", result.tableId);
++        line.put("seat", result.seat);
++        line.put("opponent", result.opponent);
++        line.put("brain", result.brain);
++        line.put("colors", result.colors);
++        line.put("pilot", result.pilot);
++        line.put("won", result.won);
++        line.put("turns", result.turns);
++        line.put("ended", result.ended);
++        line.put("record", run.wins + "-" + run.losses);
++        append(run, "games.jsonl", line);
++        if (run.wins >= WINS || run.losses >= LOSSES) {
++            run.phase = run.wins >= WINS ? "won" : "lost";
++            run.ended = result.ended;
++        }
++        save(run);
++        logger.info("Quick draft: " + seated.user + (won ? " beat " : " lost to ") + bot.name + " (" + bot.brain + "), " + run.wins + "-" + run.losses);
++    }
++
++    private QuickDraftRun view(Run run) {
++        QuickDraftRun view = new QuickDraftRun();
++        view.id = run.id;
++        view.kind = CareerLimited.DRAFT;
++        view.shape = CareerLimited.ARENA;
++        view.maxWins = WINS;
++        view.maxLosses = LOSSES;
++        view.setCode = run.setCode;
++        view.setName = run.setName;
++        view.phase = run.phase;
++        view.state = isOpen(run) ? "active" : run.phase;
++        view.wins = run.wins;
++        view.losses = run.losses;
++        view.pool = run.pool;
++        view.deck = run.deck;
++        view.picks = run.picks;
++        view.signals = CareerLimited.signals(run.passed);
++        view.brains = run.brains.subList(1, run.brains.size());
++        view.pilot = run.pilot;
++        view.claudeSkill = run.claudeSkill;
++        view.games = run.games;
++        view.started = run.started;
++        if (run.draft != null && "draft".equals(run.phase)) {
++            view.pack = run.draft.packs.get(0);
++            view.pool = run.draft.pools.get(0);
++            view.round = run.draft.round;
++            view.pick = run.draft.pick;
++            List<String> before = run.seen.get(run.draft.pick - CareerLimited.SEATS);
++            if (before != null) {
++                List<String> now = nameList(view.pack);
++                view.wheeled = new ArrayList<>();
++                view.takenSince = new ArrayList<>();
++                List<String> left = new ArrayList<>(now);
++                for (String name : before) {
++                    if (left.remove(name)) {
++                        view.wheeled.add(name);
++                    } else {
++                        view.takenSince.add(name);
++                    }
++                }
++                // your own pick from it is not news
++                view.takenSince.remove(run.mine.get(run.draft.pick - CareerLimited.SEATS));
++            }
++        }
++        if ("play".equals(run.phase) && !run.opponents.isEmpty()) {
++            QuickDraftBot next = nextOpponent(run);
++            QuickDraftBot summary = new QuickDraftBot();
++            summary.seat = next.seat;
++            summary.name = next.name;
++            summary.brain = next.brain;
++            summary.colors = next.colors;
++            summary.builtBy = next.builtBy;
++            view.next = summary;
++        }
++        return view;
++    }
++
++}
+diff --git a/Mage.Server/src/main/java/mage/server/solo/SoloGames.java b/Mage.Server/src/main/java/mage/server/solo/SoloGames.java
+index fca087fb23..6696349167 100644
+--- a/Mage.Server/src/main/java/mage/server/solo/SoloGames.java
++++ b/Mage.Server/src/main/java/mage/server/solo/SoloGames.java
+@@ -65,6 +65,8 @@ public final class SoloGames {
+         public MatchOptions options;
+         public final List<SavedSeat> seats = new ArrayList<>();
+         public CareerService.CareerTable career;
++        /** mtg-ai: the quick draft run this game plays for (QuickDraft.linkOf), or null */
++        public String quickDraft;
+     }
+ 
+     public static class SavedSeat implements Serializable {
+@@ -213,6 +215,10 @@ public final class SoloGames {
+         }
+         entry.kept = true;
+         dirty.remove(tableId);
++        if (entry.info.quickDraft != null) {
++            // mtg-ai: leaving a kept quick draft game isn't a loss; the resumed game counts for the run
++            mage.server.career.QuickDraft.get().forget(tableId);
++        }
+         try {
+             write(entry, snapshot, KEPT);
+         } catch (SQLException | IOException | RuntimeException e) {
+@@ -255,6 +261,10 @@ public final class SoloGames {
+             // the old table stops playing for anything: the new one carries on for it
+             CareerService.get().forget(tableId);
+         }
++        if (entry.info.quickDraft != null) {
++            // mtg-ai: the old table stops playing for its quick draft run: the new one carries on for it
++            mage.server.career.QuickDraft.get().forget(tableId);
++        }
+         return new Resume(entry.info, snapshot, null);
+     }
+ 
+@@ -377,6 +387,9 @@ public final class SoloGames {
+         if (resume.info.career != null) {
+             CareerService.get().adopt(tableId, resume.info.career);
+         }
++        if (resume.info.quickDraft != null) {
++            mage.server.career.QuickDraft.get().adopt(tableId, resume.info.quickDraft);
++        }
+     }
+ 
+     /** a table set up for a resume was abandoned before it started */
+@@ -440,6 +453,7 @@ public final class SoloGames {
+         info.options = options;
+         info.title = options.getName();
+         info.career = CareerService.get().tableInfo(table.getId());
++        info.quickDraft = mage.server.career.QuickDraft.get().linkOf(table.getId());
+         return info;
+     }
+ 
+diff --git a/Mage.Server/src/main/java/mage/server/websocket/api/QuickDraftApi.java b/Mage.Server/src/main/java/mage/server/websocket/api/QuickDraftApi.java
+new file mode 100644
+index 0000000000..5922b8e674
+--- /dev/null
++++ b/Mage.Server/src/main/java/mage/server/websocket/api/QuickDraftApi.java
+@@ -0,0 +1,129 @@
++package mage.server.websocket.api;
++
++import mage.cards.decks.DeckCardLists;
++import mage.players.PlayerType;
++import mage.server.career.CareerLimited;
++import mage.server.career.QuickDraft;
++import mage.server.websocket.rpc.RpcCall;
++import mage.server.websocket.rpc.RpcException;
++import mage.server.websocket.rpc.RpcMethod;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import static mage.server.websocket.rpc.RpcParam.Type.ARRAY;
++import static mage.server.websocket.rpc.RpcParam.Type.INT;
++import static mage.server.websocket.rpc.RpcParam.Type.STRING;
++import static mage.server.websocket.rpc.RpcParam.object;
++import static mage.server.websocket.rpc.RpcParam.of;
++import static mage.server.websocket.rpc.RpcParam.optional;
++
++/**
++ * mtg-ai: Quick Draft (QuickDraft.java): draft a set against seven bots with swappable pick brains, build, then play
++ * Bo1 games against the bots' decks until seven wins or three losses. Open to any signed-in player; no Career needed.
++ */
++final class QuickDraftApi {
++
++    private QuickDraftApi() {
++    }
++
++    interface Work<T> {
++        T run() throws QuickDraft.QuickDraftException;
++    }
++
++    private static <T> T refusing(Work<T> work) throws RpcException {
++        try {
++            return work.run();
++        } catch (QuickDraft.QuickDraftException e) {
++            throw RpcException.invalidParams(e.getMessage());
++        }
++    }
++
++    static List<RpcMethod> methods(ApiContext ctx) {
++        return Arrays.asList(
++                RpcMethod.named("quickDraft")
++                        .returns("QuickDraftState")
++                        .doc("Quick draft: the run in progress, recent runs, the bot brains on offer and whether the brain service is up.")
++                        .handler(call -> QuickDraft.get().state(CareerApi.user(ctx, call))),
++                RpcMethod.named("quickDraftStart")
++                        .params(of("setCode", STRING), optional("brains", ARRAY).typed("string[]"), optional("pilot", STRING), optional("claudeSkill", INT))
++                        .returns("QuickDraftRun")
++                        .doc("Start a quick draft of a set (DSK or FDN) with seven bots. Brains: one per bot seat (or one for all), "
++                                + "from quickDraft's list; missing seats take the default. Pilot: who plays the bots' decks, "
++                                + "claude (the Claude AI, with claudeSkill as the opponent picker encodes it) or mad (the Playmat AI).")
++                        .handler(call -> {
++                            String user = CareerApi.user(ctx, call);
++                            List<String> brains = new ArrayList<>();
++                            if (call.has(1)) {
++                                for (com.google.gson.JsonElement brain : call.jsonArray(1)) {
++                                    brains.add(brain.getAsString());
++                                }
++                            }
++                            String pilot = call.has(2) ? call.string(2) : "claude";
++                            int skill = call.has(3) ? call.integer(3) : 1;
++                            String setCode = call.string(0);
++                            return refusing(() -> QuickDraft.get().start(user, setCode, brains, pilot, skill));
++                        }),
++                RpcMethod.named("quickDraftPick")
++                        .params(of("index", INT))
++                        .returns("QuickDraftRun")
++                        .doc("Take the card at this position of the pack in front of you; the bots take theirs and the packs pass.")
++                        .handler(call -> {
++                            String user = CareerApi.user(ctx, call);
++                            int index = call.integer(0);
++                            return refusing(() -> QuickDraft.get().pick(user, index));
++                        }),
++                RpcMethod.named("quickDraftCoach")
++                        .returns("CareerLimitedCoach")
++                        .doc("Every colour pair of the drafted pool ranked, each with a 40-card build to start from.")
++                        .handler(call -> {
++                            String user = CareerApi.user(ctx, call);
++                            return refusing(() -> QuickDraft.get().coach(user));
++                        }),
++                RpcMethod.named("quickDraftDeck")
++                        .params(object("deck", "DeckCardLists"))
++                        .returns("QuickDraftRun")
++                        .doc("Submit the run's deck: at least 40 cards from the pool, plus any basic lands.")
++                        .handler(call -> {
++                            String user = CareerApi.user(ctx, call);
++                            DeckCardLists deck = call.object(0, DeckCardLists.class);
++                            return refusing(() -> QuickDraft.get().submitDeck(user, deck));
++                        }),
++                RpcMethod.named("quickDraftPilot")
++                        .params(of("pilot", STRING), optional("claudeSkill", INT))
++                        .returns("QuickDraftRun")
++                        .doc("Change who plays the bots' decks from the next game on: claude or mad.")
++                        .handler(call -> {
++                            String user = CareerApi.user(ctx, call);
++                            String pilot = call.string(0);
++                            int skill = call.has(1) ? call.integer(1) : 1;
++                            return refusing(() -> QuickDraft.get().setPilot(user, pilot, skill));
++                        }),
++                RpcMethod.named("quickDraftPlay")
++                        .returns("CareerMatch")
++                        .doc("Play the run's next game, Bo1, against the next bot's deck.")
++                        .handler(call -> {
++                            String user = CareerApi.user(ctx, call);
++                            QuickDraft.Plan plan = refusing(() -> QuickDraft.get().plan(user));
++                            boolean claude = "claude".equals(plan.pilot);
++                            String tableId = CareerApi.startMatch(ctx, call, user, plan.opponentName, "Limited", plan.playerDeck,
++                                    claude ? PlayerType.COMPUTER_CLAUDE : PlayerType.COMPUTER_MAD,
++                                    claude ? plan.claudeSkill : CareerLimited.OPPONENT_SKILL, plan.opponentDeck,
++                                    id -> QuickDraft.get().register(id, user, plan.runId, plan.seat));
++                            CareerApi.CareerMatch match = new CareerApi.CareerMatch();
++                            match.tableId = tableId;
++                            match.opponentId = "quickdraft:" + plan.runId;
++                            match.warm = CareerApi.printings(plan.opponentDeck);
++                            return match;
++                        }),
++                RpcMethod.named("quickDraftAbandon")
++                        .returns("QuickDraftRun")
++                        .doc("Give up the run in progress.")
++                        .handler(call -> {
++                            String user = CareerApi.user(ctx, call);
++                            return refusing(() -> QuickDraft.get().abandon(user));
++                        })
++        );
++    }
++}
+diff --git a/Mage.Server/src/main/java/mage/server/websocket/api/WebClientApi.java b/Mage.Server/src/main/java/mage/server/websocket/api/WebClientApi.java
+index ce5cbe699e..e66c40b39b 100644
+--- a/Mage.Server/src/main/java/mage/server/websocket/api/WebClientApi.java
++++ b/Mage.Server/src/main/java/mage/server/websocket/api/WebClientApi.java
+@@ -30,6 +30,7 @@ public final class WebClientApi {
+         dispatcher.registerAll(CareerProgressApi.methods(ctx));
+         dispatcher.registerAll(CareerModesApi.methods(ctx));
+         dispatcher.registerAll(SoloApi.methods(ctx));
++        dispatcher.registerAll(QuickDraftApi.methods(ctx)); // mtg-ai
+         return dispatcher;
+     }
+ }
+diff --git a/Mage.Web.Client/src/app/AppShell.tsx b/Mage.Web.Client/src/app/AppShell.tsx
+index 624961ec17..2be82016f6 100644
+--- a/Mage.Web.Client/src/app/AppShell.tsx
++++ b/Mage.Web.Client/src/app/AppShell.tsx
+@@ -23,6 +23,7 @@ import styles from './AppShell.module.css';
+ 
+ const NAV: { to: string; label: MessageKey; end?: boolean }[] = [
+   { to: '/', label: 'shell.nav.play', end: true },
++  { to: '/quickdraft', label: 'shell.nav.quickDraft' }, // mtg-ai
+   { to: '/decks', label: 'shell.nav.decks' },
+   { to: '/events', label: 'shell.nav.events' },
+   { to: '/tables', label: 'shell.nav.tables' },
+diff --git a/Mage.Web.Client/src/app/i18n/en/core.ts b/Mage.Web.Client/src/app/i18n/en/core.ts
+index ffe942cb93..5bcb0c0f24 100644
+--- a/Mage.Web.Client/src/app/i18n/en/core.ts
++++ b/Mage.Web.Client/src/app/i18n/en/core.ts
+@@ -7,6 +7,7 @@ export default {
+   'shell.home': '{app} home',
+   'shell.nav': 'Main',
+   'shell.nav.play': 'Play',
++  'shell.nav.quickDraft': 'Draft',
+   'shell.nav.decks': 'Decks',
+   'shell.nav.events': 'Events',
+   'shell.nav.tables': 'Tables',
+diff --git a/Mage.Web.Client/src/app/i18n/es.ts b/Mage.Web.Client/src/app/i18n/es.ts
+index 4d28bba9fc..9ded1535d8 100644
+--- a/Mage.Web.Client/src/app/i18n/es.ts
++++ b/Mage.Web.Client/src/app/i18n/es.ts
+@@ -27,6 +27,7 @@ const es: Catalog = {
+   'shell.home': 'Inicio de {app}',
+   'shell.nav': 'Principal',
+   'shell.nav.play': 'Jugar',
++  'shell.nav.quickDraft': 'Draft',
+   'shell.nav.decks': 'Mazos',
+   'shell.nav.events': 'Eventos',
+   'shell.nav.tables': 'Mesas',
+diff --git a/Mage.Web.Client/src/app/main.tsx b/Mage.Web.Client/src/app/main.tsx
+index 6e1ef742ff..b323c6adda 100644
+--- a/Mage.Web.Client/src/app/main.tsx
++++ b/Mage.Web.Client/src/app/main.tsx
+@@ -110,6 +110,8 @@ const router = createBrowserRouter([
+           { path: '/decks', element: <DecksScreen /> },
+           { path: '/import', element: <ImportRoute /> },
+           { path: '/decks/:deckId', lazy: () => import('./decks/DeckBuilderScreen').then((m) => ({ Component: m.DeckBuilderScreen })) },
++          // mtg-ai: Quick Draft against bots with swappable pick brains
++          { path: '/quickdraft', lazy: () => import('./quickdraft/QuickDraftScreen').then((m) => ({ Component: m.QuickDraftScreen })) },
+           { path: '/events', lazy: () => import('./screens/EventsScreen').then((m) => ({ Component: m.EventsScreen })) },
+           { path: '/event/:tournamentId', lazy: () => import('./events/EventScreen').then((m) => ({ Component: m.EventScreen })) },
+           { path: '/tables', lazy: () => import('./screens/TablesScreen').then((m) => ({ Component: m.TablesScreen })) },
+diff --git a/Mage.Web.Client/src/app/quickdraft/CardZoom.tsx b/Mage.Web.Client/src/app/quickdraft/CardZoom.tsx
+new file mode 100644
+index 0000000000..b5351828ea
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/CardZoom.tsx
+@@ -0,0 +1,28 @@
++import { createPortal } from 'react-dom';
++import { CardFace } from '../ui/CardFace';
++import { isRoomCard } from './pool';
++import type { Shown } from './zoom';
++import styles from './QuickDraft.module.css';
++
++const RATIO = 1.396; // height / width
++
++/** The zoom itself; `bound` is an x it must not cross (the deck list's left edge), or the window's width. */
++export function CardZoom({ shown, bound }: { shown: Shown | null; bound?: number }) {
++  if (!shown) return null;
++  const room = isRoomCard(shown.card);
++  const portrait = Math.min(340, window.innerWidth * 0.42);
++  const boxW = room ? portrait * RATIO : portrait;
++  const boxH = room ? portrait : portrait * RATIO;
++  // over the list itself (a hovered row), the bound is the window; elsewhere the list's left edge
++  const limit = (bound !== undefined && shown.right <= bound ? bound : window.innerWidth) - 8;
++  const left = shown.right + 12 + boxW <= limit ? shown.right + 12 : Math.max(8, shown.left - boxW - 12);
++  const top = Math.max(8, Math.min(shown.top, window.innerHeight - boxH - 8));
++  return createPortal(
++    <div className={[styles.zoom, styles.zoomTop].join(' ')} style={{ left, top, width: boxW, height: boxH }} aria-hidden="true">
++      <div className={room ? styles.zoomTurned : undefined} style={room ? { width: boxH, left: (boxW - boxH) / 2, top: (boxH - boxW) / 2 } : undefined}>
++        <CardFace card={shown.card} size="large" />
++      </div>
++    </div>,
++    document.body,
++  );
++}
+diff --git a/Mage.Web.Client/src/app/quickdraft/PoolBoard.tsx b/Mage.Web.Client/src/app/quickdraft/PoolBoard.tsx
+new file mode 100644
+index 0000000000..7bc15ac442
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/PoolBoard.tsx
+@@ -0,0 +1,274 @@
++import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
++import type { CareerPoolCard } from '../../protocol/generated/views';
++import { CardFace } from '../ui/CardFace';
++import { COLOR_BOXES, TYPE_BOXES, type CardFilter } from './filter';
++import { SIDEBOARD, colorRank, lower, sortValue, type Column } from './pool';
++import type { RoomDoors } from './rooms';
++import draft from '../events/Draft.module.css';
++import styles from './QuickDraft.module.css';
++
++/**
++ * mtg-ai: the pool in columns (pool.ts), like Arena's: drag a card with the pointer (mouse, pen or finger; Safari
++ * can't drag buttons the HTML way) to another place in its column, to another column, or into the Sideboard column.
++ * Every column always shows, so nothing moves under a dragged card. A tap or click does nothing to the deck.
++ */
++
++interface Drag {
++  at: number;
++  x: number;
++  y: number;
++  startX: number;
++  startY: number;
++  moved: boolean;
++}
++
++type Hover = (card: CareerPoolCard) => object;
++
++export function PoolBoard({ pool, columns, onPlace, hover, head, hint, filter, doors }: {
++  pool: readonly CareerPoolCard[];
++  columns: readonly Column[];
++  onPlace(at: number, label: string, position: number): void;
++  hover: Hover;
++  head?: ReactNode;
++  hint?: string;
++  /** cards not matching are greyed out, or left out of the stacks (filter.ts) */
++  filter?: CardFilter;
++  /** Rooms' doors (rooms.ts): both costs show on the card */
++  doors?: ReadonlyMap<string, RoomDoors>;
++}) {
++  const hidden = (at: number) => !!filter?.active && filter.state.hide && !filter.matches(pool[at]);
++  const shownOf = (column: Column) => column.items.filter((at) => !hidden(at));
++  const [drag, setDrag] = useState<Drag | null>(null);
++  const dragRef = useRef<Drag | null>(null);
++
++  /** the column under the pointer and the place in its stack */
++  function dropTarget(x: number, y: number): { label: string; position: number } | null {
++    const element = document.elementFromPoint(x, y)?.closest('[data-column]') as HTMLElement | null;
++    if (!element) return null;
++    const stack = element.querySelector('[data-stack]') as HTMLElement | null;
++    const step = (stack?.firstElementChild as HTMLElement | null)?.offsetWidth ?? 90;
++    const top = stack?.getBoundingClientRect().top ?? element.getBoundingClientRect().top;
++    return { label: element.dataset.column!, position: Math.max(0, Math.round((y - top) / (step * 0.3))) };
++  }
++
++  function onPointerDown(event: ReactPointerEvent, at: number) {
++    if (event.button !== 0) return;
++    const start = { at, x: event.clientX, y: event.clientY, startX: event.clientX, startY: event.clientY, moved: false };
++    dragRef.current = start;
++    setDrag(start);
++    const onMove = (move: PointerEvent) => {
++      const current = dragRef.current;
++      if (!current) return;
++      const moved = current.moved || Math.hypot(move.clientX - current.startX, move.clientY - current.startY) > 6;
++      dragRef.current = { ...current, x: move.clientX, y: move.clientY, moved };
++      if (moved) setDrag(dragRef.current);
++    };
++    const onUp = (up: PointerEvent) => {
++      window.removeEventListener('pointermove', onMove);
++      window.removeEventListener('pointerup', onUp);
++      window.removeEventListener('pointercancel', onUp);
++      const current = dragRef.current;
++      dragRef.current = null;
++      setDrag(null);
++      if (!current?.moved) return;
++      const target = dropTarget(up.clientX, up.clientY);
++      if (!target) return;
++      // the place among the cards shown (some may be hidden by the filter) -> the place in the column
++      const column = columns.find((candidate) => candidate.label === target.label);
++      const shown = column ? shownOf(column).filter((item) => item !== current.at) : [];
++      const before = shown[target.position];
++      const items = column ? column.items.filter((item) => item !== current.at) : [];
++      onPlace(current.at, target.label, before === undefined ? items.length : items.indexOf(before));
++    };
++    window.addEventListener('pointermove', onMove);
++    window.addEventListener('pointerup', onUp);
++    window.addEventListener('pointercancel', onUp);
++  }
++
++  const moving = drag?.moved ? drag : null;
++  const over = moving ? dropTarget(moving.x, moving.y)?.label : null;
++
++  return (
++    <section className={[draft.picks, styles.picks, moving ? styles.dragging : ''].join(' ')} aria-label={`Your pool, ${pool.length} cards`}>
++      <div className={styles.picksHead}>
++        {head}
++        <small className={styles.picksHint}>{hint ?? 'drag cards to arrange them, or into Sideboard to leave them out of the deck'}</small>
++      </div>
++      {filter && <FilterBar filter={filter} />}
++      <div className={[draft.columns, styles.columns].join(' ')}>
++        {columns.map((column) => (
++          <div
++            key={column.label}
++            data-column={column.label}
++            className={[draft.column, styles.column, column.items.length === 0 && column.label !== SIDEBOARD ? styles.emptyColumn : '',
++              column.label === SIDEBOARD ? styles.sideColumn : '', moving ? styles.dropTarget : '', over === column.label ? styles.dropOver : ''].join(' ')}
++          >
++            <span className={draft.columnLabel}>{column.label} <small>({column.items.length})</small></span>
++            <div data-stack className={draft.columnCards} style={{ height: `calc(var(--pick-w) * (1.4 + 0.3 * ${Math.max(0, shownOf(column).length - 1)}))` }}>
++              {shownOf(column).map((at, index) => {
++                const card = pool[at];
++                const dim = !!filter?.active && !filter.matches(card);
++                return (
++                  <div
++                    key={at}
++                    role="button"
++                    tabIndex={0}
++                    className={[draft.picked, styles.picked, column.label === SIDEBOARD ? styles.inSide : '', dim ? styles.filteredOut : '', moving?.at === at ? styles.dragged : ''].join(' ')}
++                    style={{ top: `calc(var(--pick-w) * ${0.3 * index})`, zIndex: index }}
++                    aria-label={`${card.name}, ${column.label === SIDEBOARD ? 'sideboard' : 'deck'}; drag to move`}
++                    {...(moving ? {} : hover(card))}
++                    onPointerDown={(event) => {
++                      // the zoom's long press (touch) and the drag both start here
++                      (hover(card) as { onPointerDown?(e: ReactPointerEvent): void }).onPointerDown?.(event);
++                      onPointerDown(event, at);
++                    }}
++                  >
++                    <CardFace card={{ name: card.name, setCode: card.setCode, cardNumber: card.cardNumber }} size="normal" />
++                    {doors?.get(lower(card)) && <DoorCosts room={doors.get(lower(card))!} className={styles.doorTag} />}
++                  </div>
++                );
++              })}
++            </div>
++          </div>
++        ))}
++      </div>
++      {moving && (
++        <div className={styles.ghost} style={{ left: moving.x - 45, top: moving.y - 20 }} aria-hidden="true">
++          <CardFace card={{ name: pool[moving.at].name, setCode: pool[moving.at].setCode, cardNumber: pool[moving.at].cardNumber }} size="normal" />
++        </div>
++      )}
++    </section>
++  );
++}
++
++/** Spells by mana value as bars, then colours, creatures and lands (pool.ts deckStats). */
++export function ManaCurve({ stats }: { stats: { curve: number[]; colors: { color: string; count: number }[]; spells: number; creatures: number; lands: number; average: number } }) {
++  const tallest = Math.max(1, ...stats.curve);
++  return (
++    <div className={styles.curveBox} aria-label="Mana curve of the deck">
++      <div className={styles.curve} role="img" aria-label={stats.curve.map((n, index) => `${index === 6 ? '6+' : index}: ${n}`).join(', ')}>
++        {stats.curve.map((n, index) => (
++          <span key={index}>
++            <b>{n || ''}</b>
++            <i style={{ height: `${(n / tallest) * 100}%` }} />
++            <small>{index === 6 ? '6+' : index}</small>
++          </span>
++        ))}
++      </div>
++      <p className={styles.curveFacts}>
++        {stats.colors.map(({ color, count }) => (
++          <span key={color}><i className={`ms ms-cost ms-${color.toLowerCase()}`} aria-hidden="true" /> {count}</span>
++        ))}
++        <span>{stats.creatures} creatures</span>
++        <span>{stats.spells - stats.creatures} other spells</span>
++        <span>{stats.lands} lands</span>
++        {stats.spells > 0 && <span>avg {stats.average.toFixed(1)}</span>}
++      </p>
++    </div>
++  );
++}
++
++const COLOR_NAMES: Record<string, string> = { W: 'White', U: 'Blue', B: 'Black', R: 'Red', G: 'Green', C: 'Colourless', M: 'Multicolour' };
++
++/** Tick boxes for card types and colours, grey out or hide what doesn't match, and Clear. */
++export function FilterBar({ filter }: { filter: CardFilter }) {
++  return (
++    <div className={styles.filterBar} role="group" aria-label="Filter the pool">
++      {TYPE_BOXES.map((type) => (
++        <label key={type} className={[styles.filterBox, filter.state.types.includes(type) ? styles.filterOn : ''].join(' ')}>
++          <input type="checkbox" checked={filter.state.types.includes(type)} onChange={() => filter.toggleType(type)} />
++          {type}
++        </label>
++      ))}
++      <span className={styles.filterGap} aria-hidden="true" />
++      {COLOR_BOXES.map((color) => (
++        <label key={color} className={[styles.filterBox, filter.state.colors.includes(color) ? styles.filterOn : ''].join(' ')} title={COLOR_NAMES[color]}>
++          <input type="checkbox" checked={filter.state.colors.includes(color)} onChange={() => filter.toggleColor(color)} aria-label={COLOR_NAMES[color]} />
++          {color === 'C' || color === 'M' ? <span className={styles.filterLetter}>{color === 'C' ? '◇' : 'Multi'}</span> : <i className={`ms ms-cost ms-${color.toLowerCase()}`} aria-hidden="true" />}
++        </label>
++      ))}
++      <span className={styles.filterGap} aria-hidden="true" />
++      <label className={styles.filterBox}>
++        <input type="checkbox" checked={filter.state.hide} onChange={(event) => filter.setHide(event.target.checked)} />
++        Hide others
++      </label>
++      {filter.active && <button type="button" className={styles.suggest} onClick={filter.clear}>Clear</button>}
++    </div>
++  );
++}
++
++/** "{U}" -> mana symbols */
++export function ManaCost({ cost }: { cost: string }) {
++  return (
++    <span className={styles.manaCost} aria-label={cost}>
++      {[...cost.matchAll(/\{([^}]+)\}/g)].map(([, symbol], index) => (
++        <i key={index} className={`ms ms-cost ms-${symbol.toLowerCase().replace('/', '')}`} aria-hidden="true" />
++      ))}
++    </span>
++  );
++}
++
++/** a Room's two door costs: "{U} / {4}{U}" */
++export function DoorCosts({ room, className }: { room: RoomDoors; className?: string }) {
++  return (
++    <span className={[styles.doorCosts, className ?? ''].join(' ')} title={`${room.left.name} ${room.left.cost} / ${room.right.name} ${room.right.cost}`}>
++      <ManaCost cost={room.left.cost} /><span className={styles.doorSlash}>/</span><ManaCost cost={room.right.cost} />
++    </span>
++  );
++}
++
++function Mana({ colors }: { colors: string | undefined }) {
++  return <>{[...(colors ?? '')].map((color) => <i key={color} className={`ms ms-cost ms-${color.toLowerCase()}`} aria-hidden="true" />)}</>;
++}
++
++/** A deck or sideboard list, like Arena's: how many, the name, mana value and colours, and a button to move one copy;
++ * hovering a row shows the card. */
++export function CardList({ title, cards, hint, action, actionLabel, onMove, hover, dim, filter, doors }: {
++  title: string;
++  cards: CareerPoolCard[];
++  hint: string;
++  action: string;
++  actionLabel: string;
++  onMove(card: CareerPoolCard): void;
++  hover(card: CareerPoolCard): object;
++  dim?: boolean;
++  filter?: CardFilter;
++  doors?: ReadonlyMap<string, RoomDoors>;
++}) {
++  const rows = useMemo(() => {
++    const byName = new Map<string, { card: CareerPoolCard; count: number }>();
++    for (const card of cards) {
++      const row = byName.get(lower(card));
++      if (row) row.count++;
++      else byName.set(lower(card), { card, count: 1 });
++    }
++    return [...byName.values()].sort((a, b) => Number(!!a.card.land) - Number(!!b.card.land)
++      || sortValue(a.card, doors) - sortValue(b.card, doors) || colorRank(a.card) - colorRank(b.card) || (a.card.name ?? '').localeCompare(b.card.name ?? ''));
++  }, [cards, doors]);
++  return (
++    <section className={[styles.list, dim ? styles.listDim : ''].join(' ')} aria-label={title}>
++      <header className={styles.listHead}>
++        <h2>{title} <span>{cards.length}</span></h2>
++        <small>{hint}</small>
++      </header>
++      <ul>
++        {rows.filter(({ card }) => !(filter?.active && filter.state.hide && !filter.matches(card))).map(({ card, count }) => (
++          <li key={lower(card)} className={[styles.row, filter?.active && !filter.matches(card) ? styles.filteredOut : ''].join(' ')} {...hover(card)}>
++            <span className={styles.rowCount}>{count}×</span>
++            <span className={styles.rowName}>{card.name}</span>
++            <span className={styles.rowCost}>
++              {doors?.get(lower(card)) ? <DoorCosts room={doors.get(lower(card))!} /> : (
++                <>
++                  {!card.land && <b>{card.manaValue ?? 0}</b>}
++                  <Mana colors={card.colors} />
++                </>
++              )}
++            </span>
++            <button type="button" className={styles.rowMove} title={actionLabel} aria-label={`${actionLabel}: ${card.name}`} onClick={() => onMove(card)}>{action}</button>
++          </li>
++        ))}
++        {rows.length === 0 && <li className={styles.empty}>{dim ? 'Drag cards here from your picks, or press − in the deck list.' : 'Your picks go here.'}</li>}
++      </ul>
++    </section>
++  );
++}
+diff --git a/Mage.Web.Client/src/app/quickdraft/QuickBuilder.tsx b/Mage.Web.Client/src/app/quickdraft/QuickBuilder.tsx
+new file mode 100644
+index 0000000000..2dd4581a95
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/QuickBuilder.tsx
+@@ -0,0 +1,196 @@
++import { Minus, Plus, WandSparkles } from 'lucide-react';
++import { useEffect, useMemo, useRef, useState } from 'react';
++import { createPortal } from 'react-dom';
++import type { CareerPoolCard, QuickDraftRun } from '../../protocol/generated/views';
++import { BASIC_LANDS, buildDeck, emptyBasics, poolEntries, suggestBasics, type BasicLand, type LimitedBuild } from '../career/careerModesModel';
++import { readJson, writeJson } from '../stores/persist';
++import { notify } from '../stores/toasts';
++import { Button } from '../ui/Button';
++import { CardZoom } from './CardZoom';
++import { CardList, ManaCurve, PoolBoard } from './PoolBoard';
++import { BASIC_NAMES, SIDEBOARD, arrange, roomsResorted, columnOf, deckStats, layoutKey, lower, placeIn, type Column } from './pool';
++import { submitQuickDraftDeck } from './quickDraftData';
++import { useCardFilter } from './filter';
++import { useRoomDoors } from './rooms';
++import { useCardZoom } from './zoom';
++import draft from '../events/Draft.module.css';
++import styles from './QuickDraft.module.css';
++
++/**
++ * mtg-ai: Quick Draft's deck builder, laid out like the pick screen and Arena's: the pool in mana-value columns (the
++ * arrangement and Sideboard column carry over from the draft), dragged to arrange and to move cards in and out of the
++ * deck; on the right the mana curve, the deck and sideboard lists, basic lands and the button that saves the deck.
++ * Hovering a card or a row shows it large.
++ */
++
++const SYMBOL: Record<BasicLand, string> = { Plains: 'w', Island: 'u', Swamp: 'b', Mountain: 'r', Forest: 'g' };
++const DECK_MIN = 40;
++
++function basicsKey(runId: string): string {
++  return `playmat.quickDraft.basics.${runId}`;
++}
++
++/** a saved deck (editing after games) as columns: what isn't in it goes to the Sideboard column */
++function fromDeck(pool: readonly CareerPoolCard[], run: QuickDraftRun): Record<string, number[]> {
++  const left = new Map<string, number>();
++  for (const card of run.deck ?? []) left.set((card.cardName ?? '').toLowerCase(), (left.get((card.cardName ?? '').toLowerCase()) ?? 0) + (card.amount ?? 0));
++  const columns: Record<string, number[]> = {};
++  pool.forEach((card, at) => {
++    const n = left.get(lower(card)) ?? 0;
++    const label = n > 0 || (card.land && BASIC_NAMES.includes(lower(card))) ? columnOf(card) : SIDEBOARD;
++    if (n > 0) left.set(lower(card), n - 1);
++    (columns[label] ??= []).push(at);
++  });
++  return columns;
++}
++
++function basicsFromDeck(run: QuickDraftRun): Record<BasicLand, number> {
++  const basics = emptyBasics();
++  for (const card of run.deck ?? []) {
++    const land = BASIC_LANDS.find((name) => name.toLowerCase() === (card.cardName ?? '').toLowerCase());
++    if (land) basics[land] += card.amount ?? 0;
++  }
++  return basics;
++}
++
++export function QuickBuilder({ run, onDone, onCancel }: { run: QuickDraftRun; onDone(): void; onCancel?: () => void }) {
++  const pool = useMemo(() => run.pool ?? [], [run.pool]);
++  const id = run.id ?? '';
++  const [arranged, setArranged] = useState<Record<string, number[]>>(() => {
++    const saved = readJson<Record<string, number[]> | null>(layoutKey(id), null);
++    return saved ?? (run.deck?.length ? fromDeck(pool, run) : {});
++  });
++  const [basics, setBasics] = useState<Record<BasicLand, number>>(() => readJson(basicsKey(id), run.deck?.length ? basicsFromDeck(run) : emptyBasics()));
++  const [busy, setBusy] = useState(false);
++  const zoom = useCardZoom();
++  const filter = useCardFilter(pool);
++  const doors = useRoomDoors(pool);
++  const listsRef = useRef<HTMLElement>(null);
++
++  const columns = useMemo(() => arrange(pool, arranged, doors), [pool, arranged, doors]);
++  const sideSet = useMemo(() => new Set(columns.find((column) => column.label === SIDEBOARD)?.items ?? []), [columns]);
++  const deck = useMemo(() => pool.filter((_, at) => !sideSet.has(at)), [pool, sideSet]);
++  const sideboard = useMemo(() => pool.filter((_, at) => sideSet.has(at)), [pool, sideSet]);
++  // basic lands drafted from packs are free anyway: the steppers below are the deck's basics
++  const deckCards = useMemo(() => deck.filter((card) => !(card.land && BASIC_NAMES.includes(lower(card)))), [deck]);
++  const basicCount = Object.values(basics).reduce((sum, n) => sum + n, 0);
++  const stats = deckStats(deckCards, basicCount, doors);
++  const size = deckCards.length + basicCount;
++
++  function save(next: Column[]) {
++    const stored = Object.fromEntries(next.map((column) => [column.label, column.items]));
++    writeJson(layoutKey(id), stored);
++    setArranged(stored);
++  }
++
++  // Rooms the first version sorted at their combined mana value move to their cheaper door's column, once
++  useEffect(() => {
++    const flag = `${layoutKey(id)}.rooms`;
++    if (!doors.size || readJson<boolean>(flag, false)) return;
++    const next = readJson<unknown>(layoutKey(id), null) ? roomsResorted(pool, columns, doors) : null;
++    if (next) save(next);
++    writeJson(flag, true);
++    // runs when the doors arrive; save and columns are this render's
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [doors]);
++
++  function setBasic(land: BasicLand, delta: number) {
++    setBasics((current) => {
++      const next = { ...current, [land]: Math.max(0, current[land] + delta) };
++      writeJson(basicsKey(id), next);
++      return next;
++    });
++  }
++
++  function moveCopy(card: CareerPoolCard, toSide: boolean) {
++    zoom.hide(); // the row under the pointer moves to the other list without a mouseleave
++    const at = pool.findIndex((candidate, index) => lower(candidate) === lower(card) && sideSet.has(index) !== toSide);
++    if (at < 0) return;
++    const label = toSide ? SIDEBOARD : columnOf(pool[at], doors);
++    save(placeIn(columns, at, label, columns.find((column) => column.label === label)!.items.length));
++  }
++
++  function build(): LimitedBuild {
++    const picks: Record<string, number> = {};
++    for (const card of deckCards) picks[lower(card)] = (picks[lower(card)] ?? 0) + 1;
++    return { picks, basics };
++  }
++
++  async function submit() {
++    setBusy(true);
++    try {
++      await submitQuickDraftDeck(buildDeck(build(), poolEntries(pool), `${run.setCode ?? ''} quick draft`.trim()));
++      notify('Deck saved', `${size} cards`);
++      onDone();
++    } catch (reason) {
++      notify("The deck wasn't accepted", reason instanceof Error ? reason.message : String(reason), 'error');
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const hover = (card: CareerPoolCard) => zoom.handlers({ name: card.name, setCode: card.setCode, cardNumber: card.cardNumber });
++
++  return createPortal(
++    <div className={[draft.screen, styles.immersive, styles.screen, styles.builderScreen].join(' ')}>
++      <header className={[draft.top, styles.top].join(' ')}>
++        <div className={draft.where}>
++          <span className={draft.set}>{run.setName} · Quick Draft</span>
++          <h1 className={draft.title}>Build your deck <span>· {size} / {DECK_MIN}</span></h1>
++        </div>
++        <p className={styles.pass}>Drag cards into Sideboard to leave them out; add basic lands on the right.</p>
++        <div className={draft.topRight}>
++          {onCancel && <Button variant="quiet" size="sm" onClick={onCancel}>Keep the saved deck</Button>}
++        </div>
++      </header>
++
++      <div className={styles.builderPool}>
++        <PoolBoard
++          pool={pool}
++          columns={columns}
++          onPlace={(at, label, position) => save(placeIn(columns, at, label, position))}
++          hover={hover}
++          filter={filter}
++          doors={doors}
++          head={<h2 className={draft.picksLabel}>Your pool <span>{pool.length}</span></h2>}
++        />
++      </div>
++
++      <aside ref={listsRef} className={styles.lists} aria-label="Your deck">
++        <ManaCurve stats={stats} />
++        <CardList title="Deck" cards={deckCards} hint={`${size} / ${DECK_MIN} with basics`} action="−" actionLabel="Move to sideboard" onMove={(card) => moveCopy(card, true)} hover={hover} filter={filter} doors={doors} />
++        <section className={styles.basics} aria-label="Basic lands">
++          <header className={styles.listHead}>
++            <h2>Basic lands <span>{basicCount}</span></h2>
++            <button type="button" className={styles.suggest} onClick={() => {
++              const next = suggestBasics(build(), poolEntries(pool));
++              writeJson(basicsKey(id), next);
++              setBasics(next);
++            }}>
++              <WandSparkles size={14} aria-hidden="true" /> Suggest
++            </button>
++          </header>
++          <ul>
++            {BASIC_LANDS.map((land) => (
++              <li key={land} className={styles.row}>
++                <i className={`ms ms-cost ms-${SYMBOL[land]}`} aria-hidden="true" />
++                <span className={styles.rowName}>{land}</span>
++                <button type="button" className={styles.rowMove} aria-label={`One less ${land}`} disabled={basics[land] === 0} onClick={() => setBasic(land, -1)}><Minus size={13} /></button>
++                <b className={styles.basicCount}>{basics[land]}</b>
++                <button type="button" className={styles.rowMove} aria-label={`One more ${land}`} onClick={() => setBasic(land, 1)}><Plus size={13} /></button>
++              </li>
++            ))}
++          </ul>
++        </section>
++        <CardList title="Sideboard" cards={sideboard} hint={sideboard.length === 1 ? '1 card' : `${sideboard.length} cards`} action="+" actionLabel="Add to deck" onMove={(card) => moveCopy(card, false)} hover={hover} filter={filter} doors={doors} dim />
++        <div className={styles.saveRow}>
++          {size < DECK_MIN && <span className={styles.short}>{DECK_MIN - size} more to 40</span>}
++          <Button variant="decision" busy={busy} disabled={size < DECK_MIN} onClick={() => void submit()}>Use this deck</Button>
++        </div>
++      </aside>
++
++      <CardZoom shown={zoom.shown} bound={listsRef.current?.getBoundingClientRect().left} />
++    </div>,
++    document.body,
++  );
++}
+diff --git a/Mage.Web.Client/src/app/quickdraft/QuickDraft.module.css b/Mage.Web.Client/src/app/quickdraft/QuickDraft.module.css
+new file mode 100644
+index 0000000000..065c96c0e4
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/QuickDraft.module.css
+@@ -0,0 +1,777 @@
++/* mtg-ai: Quick Draft (QuickDraftScreen.tsx); the pick screen reuses events/Draft.module.css, the rest Career's modes */
++
++/* the pick screen covers the app shell, like an event draft */
++.immersive {
++  z-index: 60;
++}
++
++/* Arena-like: the pack fills the middle, deck and sideboard lists on the right, picks by mana value below */
++.screen.screen {
++  --pick-w: clamp(96px, 7vw, 150px);
++  grid-template-columns: minmax(0, 1fr) 290px;
++  grid-template-rows: auto auto 1fr;
++  grid-template-areas: 'top top' 'pack lists' 'picks lists';
++  align-content: start;
++  /* large cards: the page scrolls to the pack's second row and the picks */
++  overflow: hidden auto;
++}
++
++.screen > header {
++  grid-area: top;
++}
++
++.packArea {
++  grid-area: pack;
++  min-width: 0;
++  display: flex;
++  flex-direction: column;
++  /* as tall as its cards: the screen scrolls rather than squeezing the pack */
++  min-height: auto;
++  padding: 0 var(--space-4);
++}
++
++.booster {
++  display: grid;
++  min-width: 0;
++  width: 100%;
++  gap: 14px;
++  justify-content: center;
++  align-content: start;
++  padding: 6px 0;
++}
++
++.packCard {
++  width: 100%;
++}
++
++.action {
++  display: flex;
++  align-items: center;
++  justify-content: flex-end;
++  gap: var(--space-4);
++  padding: var(--space-2) 0;
++}
++
++.lists {
++  grid-area: lists;
++  position: sticky;
++  top: 8px;
++  align-self: start;
++  height: calc(100vh - 16px);
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-3);
++  min-height: 0;
++  padding: var(--space-2) var(--space-4) var(--space-4) 0;
++}
++
++.list {
++  display: flex;
++  flex-direction: column;
++  flex: 3;
++  min-height: 0;
++  border-radius: var(--radius-control);
++  background: rgb(var(--void-rgb) / 0.45);
++  box-shadow: inset 0 0 0 1.5px var(--ink-ghost);
++}
++
++.listDim {
++  flex: 2;
++}
++
++.listHead {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++  gap: var(--space-2);
++  padding: var(--space-2) var(--space-3);
++  border-bottom: 1px solid var(--ink-ghost);
++}
++
++.listHead h2 {
++  margin: 0;
++  font-family: var(--font-print);
++  font-size: var(--text-lg, 18px);
++  text-transform: uppercase;
++}
++
++.listHead h2 span,
++.listHead small {
++  color: var(--ink-dim);
++  font-size: var(--text-sm);
++}
++
++.list ul {
++  flex: 1;
++  margin: 0;
++  padding: 4px;
++  overflow: auto;
++  list-style: none;
++}
++
++.row {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  width: 100%;
++  padding: 5px 8px;
++  border: 0;
++  border-radius: 6px;
++  background: transparent;
++  color: var(--ink-strong);
++  font: inherit;
++  font-size: var(--text-sm);
++  text-align: left;
++  cursor: default;
++}
++
++.rowMove {
++  flex: none;
++  display: grid;
++  place-items: center;
++  width: 24px;
++  height: 24px;
++  padding: 0;
++  border: 0;
++  border-radius: 50%;
++  background: rgb(var(--mat-rgb) / 0.9);
++  box-shadow: inset 0 0 0 1.5px var(--ink-faint);
++  color: var(--ink-strong);
++  font: inherit;
++  font-weight: 700;
++  line-height: 1;
++  cursor: pointer;
++}
++
++.rowMove:hover {
++  background: var(--decision);
++  color: var(--mat-900);
++}
++
++.row:hover {
++  background: rgb(var(--mat-rgb) / 0.9);
++}
++
++.rowCount {
++  flex: none;
++  width: 24px;
++  color: var(--ink-dim);
++}
++
++.rowName {
++  flex: 1;
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.rowCost {
++  flex: none;
++  display: inline-flex;
++  align-items: center;
++  gap: 2px;
++  color: var(--ink-soft);
++}
++
++.rowCost b {
++  margin-right: 3px;
++  font-weight: 600;
++}
++
++.listDim .row {
++  color: var(--ink-soft);
++}
++
++.empty {
++  padding: var(--space-3);
++  color: var(--ink-dim);
++  font-size: var(--text-sm);
++}
++
++.picks {
++  grid-area: picks;
++  min-height: auto;
++}
++
++/* doubled class: wins over events/Draft.module.css (its 26vh cap) whatever order the sheets load in */
++.columns.columns {
++  max-height: none;
++  min-height: 0;
++  padding-bottom: var(--space-4);
++}
++
++.column {
++  width: var(--pick-w);
++}
++
++.picked {
++  width: var(--pick-w);
++  padding: 0;
++  border: 0;
++  background: transparent;
++  cursor: grab;
++  touch-action: none;
++  user-select: none;
++}
++
++.dragging,
++.dragging * {
++  cursor: grabbing !important;
++}
++
++.emptyColumn {
++  width: calc(var(--pick-w) * 0.45);
++  opacity: 0.6;
++}
++
++.sideColumn {
++  margin-left: var(--space-5);
++  padding-left: var(--space-4);
++  border-left: 1.5px dashed var(--ink-ghost);
++  min-width: calc(var(--pick-w) + var(--space-4));
++}
++
++.manaCost {
++  display: inline-flex;
++  gap: 1px;
++}
++
++.doorCosts {
++  display: inline-flex;
++  align-items: center;
++  gap: 3px;
++  white-space: nowrap;
++}
++
++.doorSlash {
++  color: var(--ink-dim);
++}
++
++/* on a pool card: the Room's two door costs, in the strip that shows when cards are stacked */
++.doorTag {
++  position: absolute;
++  z-index: 1;
++  left: 50%;
++  top: 3px;
++  transform: translateX(-50%);
++  padding: 2px 6px;
++  border-radius: 999px;
++  background: rgb(0 0 0 / 0.75);
++  font-size: 12px;
++  pointer-events: none;
++}
++
++.filterBar {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 6px;
++  margin: 0 0 var(--space-3);
++}
++
++.filterBox {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  padding: 3px 9px;
++  border-radius: 999px;
++  background: rgb(var(--mat-rgb) / 0.7);
++  box-shadow: inset 0 0 0 1.5px var(--ink-faint);
++  color: var(--ink-soft);
++  font-size: 13px;
++  cursor: pointer;
++  user-select: none;
++}
++
++.filterBox input {
++  margin: 0;
++  accent-color: var(--decision);
++}
++
++.filterOn {
++  box-shadow: inset 0 0 0 2px var(--decision);
++  color: var(--ink-strong);
++}
++
++.filterGap {
++  width: var(--space-3);
++}
++
++.filterLetter {
++  font-size: 12px;
++}
++
++.filteredOut {
++  filter: grayscale(0.9) brightness(0.35);
++}
++
++.dropOver {
++  outline: 2px solid var(--decision);
++}
++
++.ghost {
++  position: fixed;
++  z-index: 90;
++  width: 90px;
++  opacity: 0.9;
++  pointer-events: none;
++  transform: rotate(-4deg);
++}
++
++.picksHead {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: baseline;
++  gap: var(--space-3);
++}
++
++.picksHead h2 {
++  margin-bottom: var(--space-2);
++}
++
++.mana {
++  display: inline-flex;
++  align-items: center;
++  gap: var(--space-3);
++  color: var(--ink-soft);
++  font-size: var(--text-sm);
++}
++
++.dropTarget {
++  min-height: calc(var(--pick-w) * 1.6);
++  border-radius: 8px;
++  outline: 1.5px dashed var(--ink-ghost);
++  outline-offset: 2px;
++}
++
++.dragged {
++  opacity: 0.35;
++}
++
++.inSide {
++  filter: grayscale(0.7) brightness(0.55);
++}
++
++.picksHint {
++  color: var(--ink-dim);
++  font-family: var(--font-ui, inherit);
++  font-size: 12px;
++  font-weight: 400;
++  letter-spacing: 0;
++  text-transform: none;
++}
++
++/* the deck builder: the pool fills the left, the curve, lists, basics and save on the right */
++.screen.builderScreen {
++  /* nine columns (0-6+, lands, sideboard) fit beside the lists */
++  --pick-w: clamp(84px, calc((100vw - 540px) / 9.6), 175px);
++  grid-template-rows: auto 1fr;
++  grid-template-areas: 'top top' 'pack lists';
++}
++
++.builderPool {
++  grid-area: pack;
++  min-width: 0;
++}
++
++.builderPool > section {
++  border-top: 0;
++  background: transparent;
++}
++
++.curveBox {
++  flex: none;
++  padding: var(--space-2) var(--space-3) var(--space-1, 4px);
++  border-radius: var(--radius-control);
++  background: rgb(var(--void-rgb) / 0.45);
++  box-shadow: inset 0 0 0 1.5px var(--ink-ghost);
++}
++
++.curve {
++  display: grid;
++  grid-template-columns: repeat(7, 1fr);
++  align-items: end;
++  gap: 4px;
++  height: 92px;
++}
++
++.curve span {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: flex-end;
++  height: 100%;
++  gap: 2px;
++}
++
++.curve i {
++  width: 100%;
++  min-height: 2px;
++  border-radius: 3px 3px 0 0;
++  background: var(--decision);
++}
++
++.curve b {
++  color: var(--ink-strong);
++  font-size: 12px;
++}
++
++.curve small {
++  color: var(--ink-dim);
++  font-size: 11px;
++}
++
++.curveFacts {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 4px 10px;
++  margin: 6px 0 0;
++  color: var(--ink-soft);
++  font-size: 12px;
++}
++
++.basics {
++  flex: none;
++  border-radius: var(--radius-control);
++  background: rgb(var(--void-rgb) / 0.45);
++  box-shadow: inset 0 0 0 1.5px var(--ink-ghost);
++}
++
++.basics ul {
++  margin: 0;
++  padding: 4px;
++  list-style: none;
++}
++
++.basics .row {
++  padding: 2px 8px;
++}
++
++.basicCount {
++  width: 22px;
++  text-align: center;
++}
++
++.suggest {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  padding: 2px 8px;
++  border: 0;
++  border-radius: 999px;
++  background: rgb(var(--mat-rgb) / 0.9);
++  box-shadow: inset 0 0 0 1.5px var(--ink-faint);
++  color: var(--ink-strong);
++  font: inherit;
++  font-size: 12px;
++  cursor: pointer;
++}
++
++.saveRow {
++  display: flex;
++  flex: none;
++  align-items: center;
++  justify-content: flex-end;
++  gap: var(--space-3);
++}
++
++.short {
++  color: var(--decision);
++  font-size: var(--text-sm);
++}
++
++.builderScreen .lists {
++  overflow: auto;
++}
++
++.builderScreen .list {
++  min-height: 120px;
++}
++
++/* the builder's zoom sits over the app shell's page */
++.zoomTop {
++  z-index: 120;
++}
++
++.zoomTurned {
++  position: absolute;
++  transform: rotate(90deg);
++}
++
++.zoom {
++  position: fixed;
++  z-index: 80;
++  border-radius: 14px;
++  box-shadow: 0 18px 50px rgb(0 0 0 / 0.6);
++  pointer-events: none;
++}
++
++.heading {
++  margin: 0;
++  font-size: var(--text-3xl);
++  text-transform: uppercase;
++}
++
++.form {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-4);
++}
++
++.field {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++  margin: 0;
++  padding: 0;
++  border: 0;
++}
++
++.field legend {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  margin-bottom: var(--space-2);
++  color: var(--ink-dim);
++  font-family: var(--font-print);
++  font-size: var(--text-sm);
++  font-weight: 700;
++  letter-spacing: var(--tracking-print-wide);
++  text-transform: uppercase;
++}
++
++.choices {
++  display: flex;
++  flex-wrap: wrap;
++  gap: var(--space-3);
++}
++
++.choice {
++  display: flex;
++  flex-direction: column;
++  align-items: flex-start;
++  gap: 2px;
++  min-width: 180px;
++  padding: var(--space-3) var(--space-4);
++  border: 0;
++  border-radius: var(--radius-control);
++  background: rgb(var(--mat-rgb) / 0.6);
++  box-shadow: inset 0 0 0 1.5px var(--ink-faint);
++  color: var(--ink-soft);
++  font: inherit;
++  text-align: left;
++  cursor: pointer;
++}
++
++.choice b {
++  font-family: var(--font-print);
++  font-size: var(--text-xl);
++  color: var(--ink-strong);
++}
++
++.choice span {
++  font-size: var(--text-sm);
++}
++
++.choiceOn {
++  box-shadow: inset 0 0 0 2px var(--decision);
++  background: rgb(var(--mat-rgb) / 0.9);
++}
++
++.row {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: var(--space-3);
++}
++
++.row select,
++.seatBrains select {
++  min-height: 36px;
++  padding: 0 var(--space-3);
++  border: 0;
++  border-radius: var(--radius-control);
++  background: rgb(var(--mat-rgb) / 0.8);
++  box-shadow: inset 0 0 0 1.5px var(--ink-faint);
++  color: var(--ink-strong);
++  font: inherit;
++}
++
++.check {
++  display: flex;
++  align-items: center;
++  gap: var(--space-2);
++  color: var(--ink-soft);
++  font-size: var(--text-sm);
++}
++
++.seatBrains {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
++  gap: var(--space-2);
++  margin: 0;
++  padding: 0;
++  list-style: none;
++}
++
++.seatBrains li {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--space-2);
++  color: var(--ink-soft);
++  font-size: var(--text-sm);
++}
++
++.pass {
++  margin: 0;
++  color: var(--ink-dim);
++  font-size: var(--text-sm);
++  text-align: center;
++}
++
++.wheelNote {
++  position: relative;
++  margin: 0 auto var(--space-3);
++  max-width: 900px;
++  color: var(--ink-soft);
++  font-size: var(--text-sm);
++  text-align: center;
++}
++
++
++.colorCounts {
++  display: inline-flex;
++  gap: var(--space-3);
++  margin-left: var(--space-4);
++  color: var(--ink-soft);
++  font-size: var(--text-sm);
++}
++
++.nextOpponent {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  padding: var(--space-3) var(--space-4);
++  border-radius: var(--radius-control);
++  background: rgb(var(--mat-rgb) / 0.6);
++  box-shadow: inset 0 0 0 1.5px var(--ink-faint);
++}
++
++.nextOpponent b {
++  font-family: var(--font-print);
++  font-size: var(--text-xl);
++}
++
++.games {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  margin: var(--space-3) 0 0;
++  padding: 0;
++  list-style: none;
++  color: var(--ink-soft);
++  font-size: var(--text-sm);
++}
++
++.games li {
++  display: flex;
++  align-items: center;
++  gap: var(--space-2);
++}
++
++.won,
++.lost {
++  display: grid;
++  place-items: center;
++  width: 24px;
++  height: 24px;
++  border-radius: 50%;
++  font-size: var(--text-sm);
++}
++
++.won {
++  background: var(--sage);
++  color: var(--mat-900);
++}
++
++.lost {
++  background: var(--oxblood);
++  color: var(--ink-strong);
++}
++
++@media (max-width: 800px) {
++  /* doubled class: wins over events/Draft.module.css whatever order the sheets load in */
++  .screen.screen {
++    position: fixed;
++    overflow: auto;
++    grid-template-columns: 1fr;
++    grid-template-rows: auto auto auto auto;
++    grid-template-areas: 'top' 'pack' 'lists' 'picks';
++  }
++
++  /* rows as tall as their content: the screen scrolls instead of squeezing them */
++  .screen.screen {
++    align-content: start;
++  }
++
++  .packArea,
++  .builderPool,
++  .lists,
++  .picks {
++    min-height: auto;
++  }
++
++  .packArea {
++    display: block;
++  }
++
++  .booster {
++    overflow: visible;
++  }
++
++  .lists {
++    position: static;
++    height: auto;
++    padding: 0 var(--space-4) var(--space-3);
++  }
++
++  .list ul {
++    max-height: 40vh;
++  }
++
++  .zoom {
++    display: none;
++  }
++}
++
++@media (max-width: 700px) {
++  .top {
++    grid-template-columns: 1fr auto;
++    padding: var(--space-3) var(--space-4);
++  }
++
++  .top h1 {
++    font-size: var(--text-2xl);
++  }
++
++  .booster {
++    grid-template-columns: repeat(3, minmax(0, 1fr));
++    gap: 10px;
++    max-width: none;
++  }
++
++  .action {
++    max-width: none;
++  }
++
++  .choice {
++    min-width: 0;
++    flex: 1;
++  }
++
++  .pass {
++    display: none;
++  }
++}
+diff --git a/Mage.Web.Client/src/app/quickdraft/QuickDraftScreen.tsx b/Mage.Web.Client/src/app/quickdraft/QuickDraftScreen.tsx
+new file mode 100644
+index 0000000000..e508deab1b
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/QuickDraftScreen.tsx
+@@ -0,0 +1,555 @@
++import { Bot, Layers, LogOut, Swords, Timer } from 'lucide-react';
++import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
++import { createPortal } from 'react-dom';
++import type { CareerPoolCard, QuickDraftBrain, QuickDraftRun, QuickDraftState } from '../../protocol/generated/views';
++import { registerMessages } from '../i18n';
++import careerMessages from '../i18n/en/career';
++import { CLAUDE_EFFORTS, CLAUDE_MODELS, claudeSkill } from '../screens/aiSetup';
++import type { ClaudeEffort, ClaudeModel } from '../stores/play';
++import { usePlay } from '../stores/play';
++import { readJson, writeJson } from '../stores/persist';
++import { notify } from '../stores/toasts';
++import { Button } from '../ui/Button';
++import { CardFace } from '../ui/CardFace';
++import { isEditableEventTarget } from '../ui/keys';
++import {
++  abandonQuickDraft, pickQuickDraft, playQuickDraft, setQuickDraftPilot, startQuickDraft, useQuickDraft,
++} from './quickDraftData';
++import draft from '../events/Draft.module.css';
++import modes from '../career/CareerModes.module.css';
++import { CardZoom } from './CardZoom';
++import { CardList, ManaCurve, PoolBoard } from './PoolBoard';
++import { QuickBuilder } from './QuickBuilder';
++import { SIDEBOARD, arrange, roomsResorted, columnOf, deckStats, isRoomCard, layoutKey, lower, placeIn, type Column } from './pool';
++import { useCardFilter } from './filter';
++import { useRoomDoors } from './rooms';
++import { useCardZoom } from './zoom';
++import styles from './QuickDraft.module.css';
++
++/**
++ * mtg-ai: Quick Draft, like Arena's. Pick a set, the seven bots' brains and who plays their decks; draft three packs;
++ * build 40 cards (a suggested build and lands are one click); then play Bo1 games against the bots' decks, one after
++ * another, until seven wins or three losses. Every pick of every seat is recorded on the server for training data.
++ */
++
++// the builder and the draft review are Career's and speak its messages
++registerMessages(careerMessages);
++
++const SET_NAMES: Record<string, string> = { DSK: 'Duskmourn: House of Horror', FDN: 'Foundations' };
++const PREFS = 'playmat.quickDraft.prefs';
++
++interface Prefs {
++  set: string;
++  brain: string;
++  perSeat: string[] | null;
++  pilot: 'claude' | 'mad';
++  model: ClaudeModel;
++  effort: ClaudeEffort;
++  timer: boolean;
++}
++
++const DEFAULT_PREFS: Prefs = { set: 'DSK', brain: 'statdraft', perSeat: null, pilot: 'claude', model: 'claude-opus-5-5', effort: 'high', timer: false };
++
++function message(reason: unknown): string {
++  return reason instanceof Error ? reason.message : String(reason);
++}
++
++function brainLabel(brains: QuickDraftBrain[] | undefined, name: string | undefined): string {
++  return brains?.find((brain) => brain.name === name)?.label ?? name ?? '?';
++}
++
++function pilotLabel(run: QuickDraftRun): string {
++  if (run.pilot !== 'claude') return 'Playmat AI';
++  const skill = Math.max(1, run.claudeSkill ?? 1) - 1;
++  const model = CLAUDE_MODELS[Math.floor(skill / 3)]?.value === 'claude-sonnet-5-5' ? 'Sonnet' : 'Opus';
++  return `Claude ${model} · ${CLAUDE_EFFORTS[skill % 3]?.value ?? 'low'}`;
++}
++
++function Mana({ colors }: { colors: string | undefined }) {
++  return <>{[...(colors ?? '')].map((color) => <i key={color} className={`ms ms-cost ms-${color.toLowerCase()}`} aria-hidden="true" />)}</>;
++}
++
++export function QuickDraftScreen() {
++  const state = useQuickDraft();
++  if (state.isPending) return <p className={modes.note}>Loading Quick Draft…</p>;
++  if (state.isError) return <p className={modes.error}>Quick Draft can't be reached: {message(state.error)}</p>;
++  const data = state.data ?? {};
++  const run = data.run;
++  if (run?.phase === 'draft') return <Drafting run={run} brains={data.brains} />;
++  return (
++    <div className={modes.page}>
++      <div className={modes.scroll}>
++        <header className={modes.modeHead}>
++          <h1 className={styles.heading}>Quick Draft</h1>
++          <p className={modes.lead}>Draft against seven bots, build 40 cards, then play until 7 wins or 3 losses.</p>
++        </header>
++        {run ? <Run run={run} brains={data.brains} /> : <Start data={data} />}
++        <Recent runs={data.recent ?? []} brains={data.brains} />
++      </div>
++    </div>
++  );
++}
++
++// ---- start
++
++function Start({ data }: { data: QuickDraftState }) {
++  const [prefs, setPrefs] = useState<Prefs>(() => ({ ...DEFAULT_PREFS, ...readJson<Partial<Prefs>>(PREFS, {}) }));
++  const [busy, setBusy] = useState(false);
++  const brains = data.brains ?? [];
++  const sets = data.sets ?? ['DSK', 'FDN'];
++  const update = (patch: Partial<Prefs>) => setPrefs((current) => {
++    const next = { ...current, ...patch };
++    writeJson(PREFS, next);
++    return next;
++  });
++  const seatBrains = prefs.perSeat ?? Array.from({ length: 7 }, () => prefs.brain);
++
++  async function start() {
++    setBusy(true);
++    try {
++      await startQuickDraft(prefs.set, seatBrains, prefs.pilot, claudeSkill(prefs.model, prefs.effort));
++    } catch (reason) {
++      notify("Couldn't start the draft", message(reason), 'error');
++      setBusy(false);
++    }
++  }
++
++  return (
++    <section className={modes.panel} aria-labelledby="qd-start">
++      <h2 id="qd-start" className={modes.panelTitle}>New draft</h2>
++      {!data.brainService && (
++        <p className={modes.warn} role="alert">The draft-brain service isn't answering: every bot will pick with XMage's ratings.</p>
++      )}
++      <div className={styles.form}>
++        <fieldset className={styles.field}>
++          <legend>Set</legend>
++          <div className={styles.choices}>
++            {sets.map((code) => (
++              <button key={code} type="button" className={[styles.choice, prefs.set === code ? styles.choiceOn : ''].join(' ')} aria-pressed={prefs.set === code} onClick={() => update({ set: code })}>
++                <b>{code}</b>
++                <span>{SET_NAMES[code] ?? code}</span>
++              </button>
++            ))}
++          </div>
++        </fieldset>
++
++        <fieldset className={styles.field}>
++          <legend><Bot size={15} aria-hidden="true" /> The bots' brain</legend>
++          <div className={styles.row}>
++            <select value={prefs.perSeat ? '' : prefs.brain} onChange={(event) => update({ brain: event.target.value, perSeat: null })} aria-label="Brain for every bot">
++              {prefs.perSeat && <option value="">Per seat</option>}
++              {brains.map((brain) => <option key={brain.name} value={brain.name}>{brain.label}</option>)}
++            </select>
++            <label className={styles.check}>
++              <input type="checkbox" checked={!!prefs.perSeat} onChange={(event) => update({ perSeat: event.target.checked ? seatBrains : null })} />
++              Choose per seat
++            </label>
++          </div>
++          {prefs.perSeat && (
++            <ol className={styles.seatBrains}>
++              {prefs.perSeat.map((brain, index) => (
++                <li key={index}>
++                  <span>Bot {index + 1}</span>
++                  <select value={brain} aria-label={`Brain for bot ${index + 1}`} onChange={(event) => update({ perSeat: prefs.perSeat!.map((b, i) => (i === index ? event.target.value : b)) })}>
++                    {brains.map((option) => <option key={option.name} value={option.name}>{option.label}</option>)}
++                  </select>
++                </li>
++              ))}
++            </ol>
++          )}
++        </fieldset>
++
++        <fieldset className={styles.field}>
++          <legend><Swords size={15} aria-hidden="true" /> Who plays the bots' decks</legend>
++          <div className={styles.row}>
++            <select value={prefs.pilot} onChange={(event) => update({ pilot: event.target.value as Prefs['pilot'] })} aria-label="Opponent">
++              <option value="claude">Claude AI</option>
++              <option value="mad">Playmat AI</option>
++            </select>
++            {prefs.pilot === 'claude' && (
++              <>
++                <select value={prefs.model} onChange={(event) => update({ model: event.target.value as ClaudeModel })} aria-label="Claude model">
++                  <option value="claude-opus-5-5">Opus 5.5</option>
++                  <option value="claude-sonnet-5-5">Sonnet 5.5</option>
++                </select>
++                <select value={prefs.effort} onChange={(event) => update({ effort: event.target.value as ClaudeEffort })} aria-label="Claude effort">
++                  <option value="low">Low</option>
++                  <option value="medium">Medium</option>
++                  <option value="high">High</option>
++                </select>
++              </>
++            )}
++          </div>
++        </fieldset>
++
++        <fieldset className={styles.field}>
++          <legend><Timer size={15} aria-hidden="true" /> Pick timer</legend>
++          <label className={styles.check}>
++            <input type="checkbox" checked={prefs.timer} onChange={(event) => update({ timer: event.target.checked })} />
++            Timed picks, shorter as the pack empties (a pick you don't make takes the card you chose, else the first)
++          </label>
++        </fieldset>
++      </div>
++      <div className={modes.actions}>
++        <Button variant="decision" size="lg" icon={<Layers size={18} />} busy={busy} onClick={() => void start()}>Start draft</Button>
++      </div>
++    </section>
++  );
++}
++
++// ---- drafting
++
++function pickSeconds(cardsLeft: number): number {
++  return 15 + 4 * cardsLeft;
++}
++
++function faceProps(card: CareerPoolCard) {
++  return { name: card.name, setCode: card.setCode, cardNumber: card.cardNumber };
++}
++
++function Drafting({ run, brains }: { run: QuickDraftRun; brains: QuickDraftBrain[] | undefined }) {
++  const pack = run.pack ?? [];
++  const pool = useMemo(() => run.pool ?? [], [run.pool]);
++  const [selected, setSelected] = useState<number | null>(null);
++  const [busy, setBusy] = useState(false);
++  const zoom = useCardZoom();
++  const filter = useCardFilter(pool);
++  const doors = useRoomDoors(pool);
++  const [arranged, setArranged] = useState<Record<string, number[]>>(() => readJson(layoutKey(run.id ?? ''), {}));
++  const timed = readJson<Partial<Prefs>>(PREFS, {}).timer === true;
++  const packKey = `${run.round}-${run.pick}`;
++  const [shownKey, setShownKey] = useState(packKey);
++  if (shownKey !== packKey) {
++    setShownKey(packKey);
++    setSelected(null);
++  }
++  const columns = useMemo(() => arrange(pool, arranged, doors), [pool, arranged, doors]);
++  const sideSet = useMemo(() => new Set(columns.find((column) => column.label === SIDEBOARD)?.items ?? []), [columns]);
++  const deck = useMemo(() => pool.filter((_, at) => !sideSet.has(at)), [pool, sideSet]);
++  const sideboard = useMemo(() => pool.filter((_, at) => sideSet.has(at)), [pool, sideSet]);
++  const passLeft = (run.round ?? 1) % 2 === 1;
++  const boosterRef = useRef<HTMLDivElement>(null);
++  const listsRef = useRef<HTMLElement>(null);
++  const grid = useCardGrid(boosterRef, pack.length);
++  const stats = deckStats(deck, 0, doors);
++
++  function save(next: Column[]) {
++    const stored = Object.fromEntries(next.map((column) => [column.label, column.items]));
++    writeJson(layoutKey(run.id ?? ''), stored);
++    setArranged(stored);
++  }
++
++  // Rooms the first version sorted at their combined mana value move to their cheaper door's column, once
++  useEffect(() => {
++    const flag = `${layoutKey(run.id ?? '')}.rooms`;
++    if (!doors.size || readJson<boolean>(flag, false)) return;
++    const next = readJson<unknown>(layoutKey(run.id ?? ''), null) ? roomsResorted(pool, columns, doors) : null;
++    if (next) save(next);
++    writeJson(flag, true);
++    // runs when the doors arrive; save and columns are this render's
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [doors]);
++
++  /** one copy of a card (from a list row) to the deck or the sideboard */
++  function moveCopy(card: CareerPoolCard, toSide: boolean) {
++    zoom.hide(); // the row under the pointer moves to the other list without a mouseleave
++    const at = pool.findIndex((candidate, index) => lower(candidate) === lower(card) && sideSet.has(index) !== toSide);
++    if (at < 0) return;
++    const label = toSide ? SIDEBOARD : columnOf(pool[at], doors);
++    save(placeIn(columns, at, label, columns.find((column) => column.label === label)!.items.length));
++  }
++
++  const hover = (card: CareerPoolCard) => zoom.handlers(faceProps(card));
++  // the pack's cards are already large: only a Room (printed sideways) gets a zoom, turned upright
++  const packZoom = (card: CareerPoolCard) => (isRoomCard(card) ? hover(card) : {});
++
++  async function confirm(index: number | null) {
++    if (index === null || busy) return;
++    setBusy(true);
++    zoom.hide();
++    try {
++      await pickQuickDraft(index);
++    } catch (reason) {
++      notify("Couldn't pick that card", message(reason), 'error');
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  useEffect(() => {
++    const onKey = (event: KeyboardEvent) => {
++      if (isEditableEventTarget(event.target)) return;
++      if ((event.code === 'Space' || event.key === 'Enter') && selected !== null) {
++        event.preventDefault();
++        void confirm(selected);
++      }
++    };
++    window.addEventListener('keydown', onKey);
++    return () => window.removeEventListener('keydown', onKey);
++  });
++
++  // over the whole page, like an event draft: the app shell's layout would otherwise hold the fixed screen
++  return createPortal(
++    <div className={[draft.screen, styles.immersive, styles.screen].join(' ')}>
++      <header className={[draft.top, styles.top].join(' ')}>
++        <div className={draft.where}>
++          <span className={draft.set}>{run.setName} · Quick Draft</span>
++          <h1 className={draft.title}>Pack {run.round} <span>· Pick {run.pick}</span></h1>
++        </div>
++        <p className={styles.pass}>Passing {passLeft ? 'left ←' : 'right →'} · bots: {[...new Set(run.brains ?? [])].map((name) => brainLabel(brains, name)).join(', ')}</p>
++        <div className={draft.topRight}>
++          {timed && <PickClock key={packKey} seconds={pickSeconds(pack.length)} onExpire={() => void confirm(selected ?? 0)} />}
++          <AbandonButton />
++        </div>
++      </header>
++
++      <main className={[draft.pack, styles.packArea].join(' ')} aria-label="Booster">
++        {(run.takenSince?.length ?? 0) > 0 && (
++          <p className={styles.wheelNote}>
++            This pack came back around. Taken since you saw it: {run.takenSince!.join(', ')}.
++          </p>
++        )}
++        <div ref={boosterRef} className={styles.booster} style={grid} role="listbox" aria-label={`Pick a card, ${pack.length} left in the pack`}>
++          {pack.map((card, index) => (
++            <button
++              key={`${packKey}-${index}`}
++              type="button"
++              role="option"
++              aria-selected={selected === index}
++              aria-label={card.name}
++              className={[draft.card, styles.packCard, selected === index ? draft.cardSelected : ''].join(' ')}
++              style={{ animationDelay: `${index * 25}ms` }}
++              disabled={busy}
++              onClick={() => setSelected(index)}
++              onDoubleClick={() => void confirm(index)}
++              {...packZoom(card)}
++            >
++              <CardFace card={faceProps(card)} size="large" />
++            </button>
++          ))}
++        </div>
++        <div className={styles.action}>
++          <p className={draft.hint}>{selected !== null ? 'Double-click or press Space to pick' : 'Choose a card'}</p>
++          <Button variant="decision" size="xl" busy={busy} disabled={selected === null} onClick={() => void confirm(selected)}>Pick</Button>
++        </div>
++      </main>
++
++      <aside ref={listsRef} className={styles.lists} aria-label="Your deck and sideboard">
++        <ManaCurve stats={stats} />
++        <CardList title="Deck" cards={deck} hint={`${stats.spells} spells · ${stats.lands} lands`} action="−" actionLabel="Move to sideboard" onMove={(card) => moveCopy(card, true)} hover={hover} filter={filter} doors={doors} />
++        <CardList title="Sideboard" cards={sideboard} hint={sideboard.length === 1 ? '1 card' : `${sideboard.length} cards`} action="+" actionLabel="Add to deck" onMove={(card) => moveCopy(card, false)} hover={hover} filter={filter} doors={doors} dim />
++      </aside>
++
++      <PoolBoard
++        pool={pool}
++        columns={columns}
++        onPlace={(at, label, position) => save(placeIn(columns, at, label, position))}
++        hover={hover}
++        filter={filter}
++        doors={doors}
++        head={<h2 className={draft.picksLabel}>Your picks <span>{pool.length}</span></h2>}
++      />
++
++      <CardZoom shown={zoom.shown} bound={listsRef.current?.getBoundingClientRect().left} />
++    </div>,
++    document.body,
++  );
++}
++
++const GAP = 14;
++const MAX_CARD = 330;
++
++/** The pack's grid: large cards sized by the width (the screen scrolls for a second row), a full pack in two rows. */
++function useCardGrid(ref: { current: HTMLDivElement | null }, count: number) {
++  const [width, setWidth] = useState(1200);
++  useLayoutEffect(() => {
++    const element = ref.current;
++    if (!element) return;
++    const measure = () => setWidth(element.clientWidth);
++    measure();
++    const observer = new ResizeObserver(measure);
++    observer.observe(element);
++    return () => observer.disconnect();
++  }, [ref]);
++  return useMemo(() => {
++    const n = Math.max(1, count);
++    const narrow = width < 640;
++    const cols = narrow ? 3 : Math.min(n, Math.max(5, Math.min(8, Math.ceil(n / 2))));
++    const card = Math.min(narrow ? 400 : MAX_CARD, (width - (cols - 1) * GAP) / cols);
++    return { gridTemplateColumns: `repeat(${cols}, ${Math.max(60, Math.floor(card))}px)` };
++  }, [width, count]);
++}
++
++
++function PickClock({ seconds, onExpire }: { seconds: number; onExpire(): void }) {
++  const [deadline] = useState(() => Date.now() + seconds * 1000);
++  const [now, setNow] = useState(Date.now());
++  const left = Math.max(0, deadline - now);
++  useEffect(() => {
++    const timer = setInterval(() => setNow(Date.now()), 250);
++    return () => clearInterval(timer);
++  }, []);
++  const expired = left <= 0;
++  useEffect(() => {
++    if (expired) onExpire();
++    // fires once, when time runs out
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [expired]);
++  const shown = Math.ceil(left / 1000);
++  return (
++    <div className={[draft.clock, shown <= 10 ? draft.clockLow : ''].join(' ')} role="timer" aria-label={`${shown} seconds left to pick`}>
++      <Timer size={16} aria-hidden="true" />
++      <span>{shown}</span>
++    </div>
++  );
++}
++
++function AbandonButton() {
++  const [confirming, setConfirming] = useState(false);
++  async function abandon() {
++    try {
++      await abandonQuickDraft();
++    } catch (reason) {
++      notify("Couldn't give up the run", message(reason), 'error');
++    } finally {
++      setConfirming(false);
++    }
++  }
++  return confirming ? (
++    <span className={modes.confirm} role="group" aria-label="Give up the run">
++      <span className={modes.warn}>Give up this run?</span>
++      <Button variant="danger" size="sm" onClick={() => void abandon()}>Give up</Button>
++      <Button variant="quiet" size="sm" onClick={() => setConfirming(false)}>Keep it</Button>
++    </span>
++  ) : (
++    <Button variant="quiet" size="sm" icon={<LogOut size={16} />} onClick={() => setConfirming(true)}>Give up</Button>
++  );
++}
++
++// ---- building and playing
++
++function Run({ run, brains }: { run: QuickDraftRun; brains: QuickDraftBrain[] | undefined }) {
++  const [editing, setEditing] = useState(false);
++  if (run.phase === 'build' || editing) {
++    return <QuickBuilder key={run.id} run={run} onDone={() => setEditing(false)} onCancel={run.phase === 'play' ? () => setEditing(false) : undefined} />;
++  }
++  return <Games run={run} brains={brains} onEdit={() => setEditing(true)} />;
++}
++
++function Record({ wins, losses }: { wins: number; losses: number }) {
++  return (
++    <div className={modes.record} role="img" aria-label={`${wins} wins, ${losses} losses of 7 wins or 3 losses`}>
++      <span className={modes.pips} aria-hidden="true">
++        {Array.from({ length: 7 }, (_, index) => <i key={index} className={index < wins ? modes.pipWin : modes.pip}>{index < wins ? 'W' : ''}</i>)}
++      </span>
++      <span className={modes.pips} aria-hidden="true">
++        {Array.from({ length: 3 }, (_, index) => <i key={index} className={index < losses ? modes.pipLoss : modes.pip}>{index < losses ? 'L' : ''}</i>)}
++      </span>
++      <span aria-hidden="true">{wins}–{losses}</span>
++    </div>
++  );
++}
++
++function Games({ run, brains, onEdit }: { run: QuickDraftRun; brains: QuickDraftBrain[] | undefined; onEdit(): void }) {
++  const playing = usePlay((play) => play.phase !== 'idle');
++  const [starting, setStarting] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const wins = run.wins ?? 0;
++  const losses = run.losses ?? 0;
++  const next = run.next;
++  const deckSize = (run.deck ?? []).reduce((sum, card) => sum + (card.amount ?? 0), 0);
++
++  async function play() {
++    setStarting(true);
++    setError(null);
++    try {
++      await playQuickDraft();
++    } catch (reason) {
++      setError(message(reason));
++      setStarting(false);
++    }
++  }
++
++  async function changePilot(value: string) {
++    try {
++      const [pilot, model, effort] = value.split('|');
++      await setQuickDraftPilot(pilot, pilot === 'claude' ? claudeSkill(model as ClaudeModel, effort as ClaudeEffort) : 1);
++    } catch (reason) {
++      notify("Couldn't change the opponent", message(reason), 'error');
++    }
++  }
++
++  const skill = Math.max(1, run.claudeSkill ?? 1) - 1;
++  const pilotValue = run.pilot === 'claude' ? `claude|${CLAUDE_MODELS[Math.floor(skill / 3)]?.value}|${CLAUDE_EFFORTS[skill % 3]?.value}` : 'mad|';
++
++  return (
++    <section className={modes.panel} aria-labelledby="qd-games">
++      <h2 id="qd-games" className={modes.panelTitle}>{run.setName} · Game {wins + losses + 1}</h2>
++      <Record wins={wins} losses={losses} />
++      {next && (
++        <div className={styles.nextOpponent}>
++          <span className={modes.small}>Next opponent</span>
++          <b>Bot {next.seat} <Mana colors={next.colors} /></b>
++          <span className={modes.small}>drafted by {brainLabel(brains, next.brain)}{next.builtBy === 'fallback' ? ' (deck by the fallback builder)' : ''} · played by {pilotLabel(run)}</span>
++        </div>
++      )}
++      <div className={styles.row}>
++        <label className={modes.small} htmlFor="qd-pilot">Opponent AI</label>
++        <select id="qd-pilot" value={pilotValue} onChange={(event) => void changePilot(event.target.value)}>
++          {CLAUDE_MODELS.flatMap((model) => CLAUDE_EFFORTS.map((effort) => (
++            <option key={`${model.value}-${effort.value}`} value={`claude|${model.value}|${effort.value}`}>
++              Claude {model.value === 'claude-opus-5-5' ? 'Opus' : 'Sonnet'} · {effort.value}
++            </option>
++          )))}
++          <option value="mad|">Playmat AI</option>
++        </select>
++      </div>
++      <p className={modes.small}>Your deck: {deckSize} cards.</p>
++      {error && <p className={modes.error} role="alert">Couldn't start the game: {error}</p>}
++      <div className={modes.actions}>
++        <Button variant="decision" size="lg" icon={<Swords size={18} />} busy={starting} disabled={playing} onClick={() => void play()}>
++          {starting ? 'Starting…' : 'Play'}
++        </Button>
++        <Button variant="print" size="sm" icon={<Layers size={16} />} onClick={onEdit}>Edit deck</Button>
++        <AbandonButton />
++      </div>
++      <GameList run={run} brains={brains} />
++    </section>
++  );
++}
++
++function GameList({ run, brains }: { run: QuickDraftRun; brains: QuickDraftBrain[] | undefined }) {
++  const games = run.games ?? [];
++  if (games.length === 0) return null;
++  return (
++    <ol className={styles.games}>
++      {games.map((game) => (
++        <li key={game.number}>
++          <b className={game.won ? styles.won : styles.lost}>{game.won ? 'W' : 'L'}</b>
++          <span>Game {game.number} vs Bot {game.seat} <Mana colors={game.colors} /> · {brainLabel(brains, game.brain)} · {game.pilot === 'claude' ? 'Claude' : 'Playmat AI'} · turn {game.turns}</span>
++        </li>
++      ))}
++    </ol>
++  );
++}
++
++const END: Record<string, string> = { won: 'Finished: 7 wins', lost: 'Finished', abandoned: 'Given up' };
++
++function Recent({ runs, brains }: { runs: QuickDraftRun[]; brains: QuickDraftBrain[] | undefined }) {
++  if (runs.length === 0) return null;
++  return (
++    <section className={modes.card} aria-labelledby="qd-recent">
++      <h2 id="qd-recent" className={modes.cardLabel}>Recent drafts</h2>
++      <ul className={modes.recentRuns}>
++        {runs.map((run) => (
++          <li key={run.id}>
++            <span>
++              {run.setCode} · {run.wins ?? 0}–{run.losses ?? 0} · {END[run.phase ?? ''] ?? run.phase} · bots: {[...new Set(run.brains ?? [])].map((name) => brainLabel(brains, name)).join(', ')}
++              {run.started ? ` · ${new Date(run.started).toLocaleDateString()}` : ''}
++            </span>
++          </li>
++        ))}
++      </ul>
++    </section>
++  );
++}
+diff --git a/Mage.Web.Client/src/app/quickdraft/filter.ts b/Mage.Web.Client/src/app/quickdraft/filter.ts
+new file mode 100644
+index 0000000000..65dd6762d3
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/filter.ts
+@@ -0,0 +1,86 @@
++import { useMemo, useState } from 'react';
++import type { CareerPoolCard } from '../../protocol/generated/views';
++import type { DeckCardInfo } from '../../core/decks/types';
++import { useCardInfo } from '../decks/cardInfo';
++import { entryKey } from '../decks/deckModel';
++import { readJson, writeJson } from '../stores/persist';
++import { isRoomCard } from './pool';
++
++/**
++ * mtg-ai: Quick Draft's card filter: tick card types and colours; cards that match none of the ticked boxes of a
++ * group are greyed out, or hidden. Nothing ticked: everything shows. The types come from the card database (the pool
++ * only says creature or land). Remembered in this browser.
++ */
++
++export const TYPE_BOXES = ['Creature', 'Enchantment', 'Room', 'Instant', 'Sorcery', 'Artifact', 'Land'] as const;
++export const COLOR_BOXES = ['W', 'U', 'B', 'R', 'G', 'C', 'M'] as const;
++export type TypeBox = (typeof TYPE_BOXES)[number];
++export type ColorBox = (typeof COLOR_BOXES)[number];
++
++export interface FilterState {
++  types: TypeBox[];
++  colors: ColorBox[];
++  hide: boolean;
++}
++
++const KEY = 'playmat.quickDraft.filter';
++const EMPTY: FilterState = { types: [], colors: [], hide: false };
++
++export function useCardFilter(pool: readonly CareerPoolCard[]) {
++  const [state, setState] = useState<FilterState>(() => ({ ...EMPTY, ...readJson<Partial<FilterState>>(KEY, {}) }));
++  const entries = useMemo<DeckCardInfo[]>(() => pool.map((card) => ({ cardName: card.name ?? '', setCode: card.setCode ?? '', cardNumber: card.cardNumber ?? '', amount: 1 })), [pool]);
++  const info = useCardInfo(entries);
++
++  const update = (next: FilterState) => {
++    writeJson(KEY, next);
++    setState(next);
++  };
++
++  /** the card's type boxes: from the card database, else what the pool knows */
++  const typesOf = (card: CareerPoolCard): Set<TypeBox> => {
++    const view = info.get(entryKey({ cardName: card.name ?? '', setCode: card.setCode, cardNumber: card.cardNumber }));
++    const types = new Set<TypeBox>();
++    for (const type of view?.cardTypes ?? []) {
++      const named = (type.charAt(0) + type.slice(1).toLowerCase()) as TypeBox;
++      if ((TYPE_BOXES as readonly string[]).includes(named)) types.add(named);
++    }
++    if (card.creature) types.add('Creature');
++    if (card.land) types.add('Land');
++    if (isRoomCard(card)) {
++      types.add('Room');
++      types.add('Enchantment');
++    }
++    return types;
++  };
++
++  const colorsOf = (card: CareerPoolCard): ColorBox[] => {
++    const colors = card.colors ?? '';
++    if (colors.length === 0) return ['C'];
++    return colors.length > 1 ? ['M', ...(colors.split('') as ColorBox[])] : [colors as ColorBox];
++  };
++
++  const active = state.types.length > 0 || state.colors.length > 0;
++  const matches = (card: CareerPoolCard): boolean => {
++    if (state.types.length > 0) {
++      const types = typesOf(card);
++      if (!state.types.some((type) => types.has(type))) return false;
++    }
++    if (state.colors.length > 0) {
++      const colors = colorsOf(card);
++      if (!state.colors.some((color) => colors.includes(color))) return false;
++    }
++    return true;
++  };
++
++  return {
++    state,
++    active,
++    matches,
++    toggleType: (type: TypeBox) => update({ ...state, types: state.types.includes(type) ? state.types.filter((t) => t !== type) : [...state.types, type] }),
++    toggleColor: (color: ColorBox) => update({ ...state, colors: state.colors.includes(color) ? state.colors.filter((c) => c !== color) : [...state.colors, color] }),
++    setHide: (hide: boolean) => update({ ...state, hide }),
++    clear: () => update({ ...EMPTY, hide: state.hide }),
++  };
++}
++
++export type CardFilter = ReturnType<typeof useCardFilter>;
+diff --git a/Mage.Web.Client/src/app/quickdraft/pool.ts b/Mage.Web.Client/src/app/quickdraft/pool.ts
+new file mode 100644
+index 0000000000..b2f7422e77
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/pool.ts
+@@ -0,0 +1,120 @@
++import type { CareerPoolCard } from '../../protocol/generated/views';
++import type { RoomDoors } from './rooms';
++
++/**
++ * mtg-ai: Quick Draft's picks laid out in columns, like Arena's pool: by mana value (0 to 6+), lands, and a Sideboard
++ * column for what's left out of the deck. The player rearranges them by dragging; the layout is kept in this browser
++ * per run (by each pick's place in the pool, which never changes), from the first pick to the deck builder.
++ */
++
++export const COLOR_ORDER = 'WUBRG';
++export const SIDEBOARD = 'Sideboard';
++export const COLUMN_LABELS = ['0', '1', '2', '3', '4', '5', '6+', 'Lands', SIDEBOARD];
++export const BASIC_NAMES = ['plains', 'island', 'swamp', 'mountain', 'forest'];
++
++export interface Column {
++  label: string;
++  /** places in the pool, top of the stack first */
++  items: number[];
++}
++
++export const lower = (card: CareerPoolCard) => (card.name ?? '').toLowerCase();
++
++export function colorRank(card: CareerPoolCard): number {
++  const colors = card.colors ?? '';
++  if (colors.length === 0) return 6;
++  if (colors.length > 1) return 5;
++  return COLOR_ORDER.indexOf(colors);
++}
++
++export function layoutKey(runId: string): string {
++  return `playmat.quickDraft.layout.${runId}`;
++}
++
++type Doors = ReadonlyMap<string, RoomDoors> | undefined;
++
++/** the mana value a card is sorted and counted at: a Room's cheaper door (rooms.ts), else its own */
++export function sortValue(card: CareerPoolCard, doors?: Doors): number {
++  return doors?.get(lower(card))?.cheap ?? card.manaValue ?? 0;
++}
++
++function valueColumn(value: number): string {
++  return COLUMN_LABELS[Math.min(6, Math.max(0, value))];
++}
++
++/** the column a card starts in: its mana value (a Room's cheaper door), lands last */
++export function columnOf(card: CareerPoolCard, doors?: Doors): string {
++  return card.land ? 'Lands' : valueColumn(sortValue(card, doors));
++}
++
++/**
++ * Rooms that sit in the column of their combined mana value, where the first version of this screen put them, moved
++ * to their cheaper door's column: the layout to save once, or null when there's nothing to move.
++ */
++export function roomsResorted(pool: readonly CareerPoolCard[], columns: readonly Column[], doors: Doors): Column[] | null {
++  if (!doors?.size) return null;
++  let next: Column[] | null = null;
++  for (const column of columns) {
++    for (const at of column.items) {
++      const card = pool[at];
++      const room = doors.get(lower(card));
++      if (!room || card.land) continue;
++      const combined = valueColumn(card.manaValue ?? 0);
++      const cheap = valueColumn(room.cheap);
++      if (column.label === combined && cheap !== combined) {
++        next = placeIn(next ?? columns, at, cheap, (next ?? columns).find((candidate) => candidate.label === cheap)!.items.length);
++      }
++    }
++  }
++  return next;
++}
++
++/** The pool in columns: where the player put each card, the rest in their mana value's column in colour order. */
++export function arrange(pool: readonly CareerPoolCard[], arranged: Record<string, number[]>, doors?: Doors): Column[] {
++  const placed = new Set<number>();
++  const columns: Record<string, number[]> = Object.fromEntries(COLUMN_LABELS.map((label) => [label, []]));
++  for (const [label, items] of Object.entries(arranged)) {
++    if (!columns[label] || !Array.isArray(items)) continue;
++    for (const at of items) {
++      if (Number.isInteger(at) && at >= 0 && at < pool.length && !placed.has(at)) {
++        columns[label].push(at);
++        placed.add(at);
++      }
++    }
++  }
++  const fresh = pool.map((_, at) => at).filter((at) => !placed.has(at))
++    .sort((a, b) => colorRank(pool[a]) - colorRank(pool[b]) || (pool[a].name ?? '').localeCompare(pool[b].name ?? ''));
++  for (const at of fresh) columns[columnOf(pool[at], doors)].push(at);
++  return COLUMN_LABELS.map((label) => ({ label, items: columns[label] }));
++}
++
++/** the columns with one card moved to a place in another (or the same) column */
++export function placeIn(columns: readonly Column[], at: number, label: string, position: number): Column[] {
++  const next = columns.map((column) => ({ label: column.label, items: column.items.filter((item) => item !== at) }));
++  const target = next.find((column) => column.label === label);
++  if (!target) return next;
++  target.items.splice(Math.max(0, Math.min(position, target.items.length)), 0, at);
++  return next;
++}
++
++/** a Room (two doors on one card) is printed sideways */
++export function isRoomCard(card: { name?: string; setCode?: string }): boolean {
++  return (card.name ?? '').includes(' // ') && card.setCode === 'DSK';
++}
++
++/** the deck's numbers, as Arena shows them: spells by mana value, colours, creatures and lands */
++export function deckStats(cards: readonly CareerPoolCard[], basics = 0, doors?: Doors) {
++  const spells = cards.filter((card) => !card.land);
++  const curve = [0, 0, 0, 0, 0, 0, 0];
++  for (const card of spells) curve[Math.min(6, Math.max(0, sortValue(card, doors)))]++;
++  const colors = COLOR_ORDER.split('').map((color) => ({ color, count: spells.filter((card) => (card.colors ?? '').includes(color)).length }))
++    .filter((entry) => entry.count > 0);
++  return {
++    curve,
++    colors,
++    spells: spells.length,
++    creatures: spells.filter((card) => card.creature).length,
++    lands: cards.length - spells.length + basics,
++    average: spells.length ? spells.reduce((sum, card) => sum + sortValue(card, doors), 0) / spells.length : 0,
++  };
++}
+diff --git a/Mage.Web.Client/src/app/quickdraft/quickDraftData.ts b/Mage.Web.Client/src/app/quickdraft/quickDraftData.ts
+new file mode 100644
+index 0000000000..5254b1ab22
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/quickDraftData.ts
+@@ -0,0 +1,59 @@
++import { useQuery } from '@tanstack/react-query';
++import type { QuickDraftRun, QuickDraftState } from '../../protocol/generated/views';
++import { warmMatch } from '../career/careerData';
++import { api } from '../connection';
++import { queryClient } from '../queries';
++import { useEvents } from '../stores/events';
++import { usePlay } from '../stores/play';
++
++/** mtg-ai: Quick Draft's server state (QuickDraftApi): the run in progress, recent runs and the bot brains on offer. */
++
++const KEY = ['quickDraft'] as const;
++
++export function useQuickDraft() {
++  return useQuery({ queryKey: KEY, queryFn: () => api.quickDraft(), staleTime: 0 });
++}
++
++function setRun(run: QuickDraftRun): void {
++  queryClient.setQueryData<QuickDraftState>(KEY, (state) => ({ ...(state ?? {}), run: run.state === 'active' ? run : undefined }));
++  if (run.state !== 'active') void queryClient.invalidateQueries({ queryKey: KEY });
++}
++
++export async function startQuickDraft(setCode: string, brains: string[], pilot: string, claudeSkill: number): Promise<void> {
++  setRun(await api.quickDraftStart(setCode, brains, pilot, claudeSkill));
++}
++
++export async function pickQuickDraft(index: number): Promise<QuickDraftRun> {
++  const run = await api.quickDraftPick(index);
++  setRun(run);
++  return run;
++}
++
++export async function submitQuickDraftDeck(deck: Parameters<typeof api.quickDraftDeck>[0]): Promise<void> {
++  setRun(await api.quickDraftDeck(deck));
++}
++
++export async function setQuickDraftPilot(pilot: string, claudeSkill: number): Promise<void> {
++  setRun(await api.quickDraftPilot(pilot, claudeSkill));
++}
++
++export async function abandonQuickDraft(): Promise<void> {
++  setRun(await api.quickDraftAbandon());
++}
++
++/** The run's next game: the server sets the table up; the game opens like any other and leaving it comes back here. */
++export async function playQuickDraft(): Promise<void> {
++  useEvents.setState({ currentTournamentId: null });
++  usePlay.setState({ phase: 'waitingForGame', error: null, deckId: null, returnPath: '/quickdraft' });
++  try {
++    const match = await api.quickDraftPlay();
++    warmMatch(match);
++    usePlay.setState({ tableId: match?.tableId ?? null, returnPath: '/quickdraft' });
++  } catch (error) {
++    usePlay.setState({ phase: 'idle', tableId: null });
++    throw error;
++  } finally {
++    // the result is counted when the match ends; come back to a fresh record
++    void queryClient.invalidateQueries({ queryKey: KEY });
++  }
++}
+diff --git a/Mage.Web.Client/src/app/quickdraft/rooms.ts b/Mage.Web.Client/src/app/quickdraft/rooms.ts
+new file mode 100644
+index 0000000000..f4c3f7aa06
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/rooms.ts
+@@ -0,0 +1,63 @@
++import { useMemo } from 'react';
++import type { CardView, CareerPoolCard } from '../../protocol/generated/views';
++import type { DeckCardInfo } from '../../core/decks/types';
++import { useCardInfo } from '../decks/cardInfo';
++import { entryKey } from '../decks/deckModel';
++import { isRoomCard, lower } from './pool';
++
++/**
++ * mtg-ai: a Room's two doors and their costs, from the card database (the pool only has the Room's combined mana
++ * value). A Room is cast one door at a time, so Quick Draft sorts and counts it at its cheaper door.
++ */
++
++export interface Door {
++  name: string;
++  /** "{4}{U}" */
++  cost: string;
++  manaValue: number;
++}
++
++export interface RoomDoors {
++  left: Door;
++  right: Door;
++  /** the cheaper door's mana value */
++  cheap: number;
++}
++
++/** {4}{U} -> 5; {X} counts 0, a hybrid or Phyrexian symbol 1 */
++export function manaValueOf(cost: string): number {
++  let value = 0;
++  for (const [, symbol] of cost.matchAll(/\{([^}]+)\}/g)) {
++    if (/^\d+$/.test(symbol)) value += Number(symbol);
++    else if (symbol.toUpperCase() !== 'X') value += 1;
++  }
++  return value;
++}
++
++function costOf(view: CardView, side: 'left' | 'right'): string {
++  const listed = side === 'left' ? view.manaCostLeftStr : view.manaCostRightStr;
++  if (listed?.length) return listed.join('');
++  return (side === 'left' ? view.leftSplitCostsStr : view.rightSplitCostsStr) ?? '';
++}
++
++/** each Room in the pool (by lower-case name) with its doors, once the card database has answered */
++export function useRoomDoors(pool: readonly CareerPoolCard[]): ReadonlyMap<string, RoomDoors> {
++  const rooms = useMemo(() => pool.filter(isRoomCard), [pool]);
++  const entries = useMemo<DeckCardInfo[]>(() => rooms.map((card) => ({ cardName: card.name ?? '', setCode: card.setCode ?? '', cardNumber: card.cardNumber ?? '', amount: 1 })), [rooms]);
++  const info = useCardInfo(entries);
++  return useMemo(() => {
++    const doors = new Map<string, RoomDoors>();
++    for (const card of rooms) {
++      const view = info.get(entryKey({ cardName: card.name ?? '', setCode: card.setCode, cardNumber: card.cardNumber }));
++      if (!view) continue;
++      const [leftName, rightName] = (card.name ?? '').split(' // ');
++      const left = { name: view.leftSplitName ?? leftName, cost: costOf(view, 'left'), manaValue: 0 };
++      const right = { name: view.rightSplitName ?? rightName, cost: costOf(view, 'right'), manaValue: 0 };
++      if (!left.cost || !right.cost) continue;
++      left.manaValue = manaValueOf(left.cost);
++      right.manaValue = manaValueOf(right.cost);
++      doors.set(lower(card), { left, right, cheap: Math.min(left.manaValue, right.manaValue) });
++    }
++    return doors;
++  }, [rooms, info]);
++}
+diff --git a/Mage.Web.Client/src/app/quickdraft/zoom.ts b/Mage.Web.Client/src/app/quickdraft/zoom.ts
+new file mode 100644
+index 0000000000..256576e308
+--- /dev/null
++++ b/Mage.Web.Client/src/app/quickdraft/zoom.ts
+@@ -0,0 +1,74 @@
++import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
++
++/**
++ * mtg-ai: a card shown large while the pointer is over its tile or list row (Quick Draft), beside it and never over
++ * the deck list. A Room, printed sideways, is turned upright (CardZoom.tsx). On a touch screen a long press shows it
++ * and the next tap anywhere closes it.
++ */
++
++export interface ZoomCardInfo {
++  name?: string;
++  setCode?: string;
++  cardNumber?: string;
++}
++
++export interface Shown {
++  card: ZoomCardInfo;
++  left: number;
++  right: number;
++  top: number;
++}
++
++const LONG_PRESS_MS = 450;
++
++/** Zoom state and the handlers to spread on each hoverable element. */
++export function useCardZoom() {
++  const [shown, setShown] = useState<Shown | null>(null);
++  const press = useRef<ReturnType<typeof setTimeout> | null>(null);
++  // a long press shows the card: the click that ends it must not also add the card to the deck
++  const swallowClick = useRef(false);
++
++  useEffect(() => {
++    if (!shown) return;
++    // a touch-opened zoom closes on the next tap; a mouse one when the pointer leaves
++    const close = () => setShown(null);
++    window.addEventListener('pointerdown', close, true);
++    return () => window.removeEventListener('pointerdown', close, true);
++  }, [shown]);
++
++  const show = (card: ZoomCardInfo, element: HTMLElement) => {
++    const rect = element.getBoundingClientRect();
++    setShown({ card, left: rect.left, right: rect.right, top: rect.top });
++  };
++
++  const handlers = (card: ZoomCardInfo) => ({
++    onMouseEnter: (event: ReactMouseEvent) => show(card, event.currentTarget as HTMLElement),
++    onMouseLeave: () => setShown(null),
++    onPointerDown: (event: ReactPointerEvent) => {
++      if (event.pointerType !== 'touch') return;
++      const element = event.currentTarget as HTMLElement;
++      press.current = setTimeout(() => {
++        swallowClick.current = true;
++        show(card, element);
++      }, LONG_PRESS_MS);
++    },
++    onPointerUp: () => {
++      if (press.current) clearTimeout(press.current);
++    },
++    onPointerCancel: () => {
++      if (press.current) clearTimeout(press.current);
++    },
++    onClickCapture: (event: ReactMouseEvent) => {
++      if (!swallowClick.current) return;
++      swallowClick.current = false;
++      event.stopPropagation();
++      event.preventDefault();
++    },
++    onContextMenu: (event: ReactMouseEvent) => {
++      if (swallowClick.current) event.preventDefault(); // no copy/share menu over the long press
++    },
++  });
++
++  return { shown, handlers, hide: () => setShown(null) };
++}
++
+diff --git a/Mage.Web.Client/src/protocol/generated/api.ts b/Mage.Web.Client/src/protocol/generated/api.ts
+index 4881ee167e..29d0ef11aa 100644
+--- a/Mage.Web.Client/src/protocol/generated/api.ts
++++ b/Mage.Web.Client/src/protocol/generated/api.ts
+@@ -463,6 +463,22 @@ export function createApi(rpc: RpcCaller) {
+       rpc.call('careerLimitedPlay'),
+     careerLimitedAbandon: () =>
+       rpc.call('careerLimitedAbandon'),
++    quickDraft: () =>
++      rpc.call('quickDraft'),
++    quickDraftStart: (setCode: string, brains?: string[] | null, pilot?: string | null, claudeSkill?: number | null) =>
++      rpc.call('quickDraftStart', setCode, brains, pilot, claudeSkill),
++    quickDraftPick: (index: number) =>
++      rpc.call('quickDraftPick', index),
++    quickDraftCoach: () =>
++      rpc.call('quickDraftCoach'),
++    quickDraftDeck: (deck: DeckCardLists) =>
++      rpc.call('quickDraftDeck', deck),
++    quickDraftPilot: (pilot: string, claudeSkill?: number | null) =>
++      rpc.call('quickDraftPilot', pilot, claudeSkill),
++    quickDraftPlay: () =>
++      rpc.call('quickDraftPlay'),
++    quickDraftAbandon: () =>
++      rpc.call('quickDraftAbandon'),
+     soloSaves: () =>
+       rpc.call('soloSaves'),
+     soloResume: (saveId: string) =>
+diff --git a/Mage.Web.Client/src/protocol/generated/protocol.ts b/Mage.Web.Client/src/protocol/generated/protocol.ts
+index d1c869196b..3b56a9f9a0 100644
+--- a/Mage.Web.Client/src/protocol/generated/protocol.ts
++++ b/Mage.Web.Client/src/protocol/generated/protocol.ts
+@@ -1,7 +1,7 @@
+ // Generated by Mage.Server WebClientApiDocsTest from the server's RPC registry. Do not edit.
+ // Regenerate: mvn -pl Mage.Server test -Dtest=WebClientApiDocsTest -Dxmage.updateWebApiDocs=true
+ 
+-import type { AbilityPickerView, AccessOverview, AccessRequest, AccountDetail, AccountEmailStatus, AccountsPage, AdaptiveView, Advice, AllowEntry, Assists, AuditEntry, BasicLandSetInfo, BatchJob, BatchStatus, CardCriteria, CardView, CareerAchievement, CareerAdminView, CareerCampaign, CareerCard, CareerCatalogItem, CareerChallenge, CareerDaily, CareerDailyPuzzle, CareerGameResult, CareerGauntletState, CareerHall, CareerHorde, CareerLevelTrack, CareerLimitedCoach, CareerLimitedRun, CareerLimitedState, CareerLiveQuest, CareerMachines, CareerMastery, CareerMatch, CareerMinedPuzzle, CareerOpponent, CareerPackResult, CareerProfile, CareerPublicProfile, CareerPullResult, CareerPuzzle, CareerQuests, CareerRun, CareerSetProgress, CareerShopSet, CareerStarter, CareerState, CareerWeekly, ChatMessage, ClientError, ClientErrorGroup, ContentPackView, DeckCardInfo, DeckCardLists, DeckPutResult, DeckSourceStatus, DeckSyncEntry, DeckValidationResult, DraftClientMessage, DraftPickView, ExpansionSetInfo, FeedbackEntry, GameClientMessage, GameEndView, GameTypeView, GameView, GhostDeck, GhostOpponent, GithubSignInResult, ImportedDeck, InboxNote, Invite, InviteCheck, JobSpec, Leaderboard, ManaType, MatchView, MetaFormat, Payment, PlayerAction, PlayerEmote, PlayerLook, PlayerReport, Puzzle, PuzzleExport, ReplayInfo, RoomUsersView, ServerInfo, ServerSettings, ServerState, ServerStats, SoloSave, SoloTable, SoloTurn, StaffList, StaffMe, StaffMember, StaffResetCode, StartOptions, SupportLedger, SupportStatus, SupportYou, TableClientMessage, TableView, TournamentTypeView, TournamentView, UpdateStatus, UserData, UserRequestMessage, UserView } from './views';
++import type { AbilityPickerView, AccessOverview, AccessRequest, AccountDetail, AccountEmailStatus, AccountsPage, AdaptiveView, Advice, AllowEntry, Assists, AuditEntry, BasicLandSetInfo, BatchJob, BatchStatus, CardCriteria, CardView, CareerAchievement, CareerAdminView, CareerCampaign, CareerCard, CareerCatalogItem, CareerChallenge, CareerDaily, CareerDailyPuzzle, CareerGameResult, CareerGauntletState, CareerHall, CareerHorde, CareerLevelTrack, CareerLimitedCoach, CareerLimitedRun, CareerLimitedState, CareerLiveQuest, CareerMachines, CareerMastery, CareerMatch, CareerMinedPuzzle, CareerOpponent, CareerPackResult, CareerProfile, CareerPublicProfile, CareerPullResult, CareerPuzzle, CareerQuests, CareerRun, CareerSetProgress, CareerShopSet, CareerStarter, CareerState, CareerWeekly, ChatMessage, ClientError, ClientErrorGroup, ContentPackView, DeckCardInfo, DeckCardLists, DeckPutResult, DeckSourceStatus, DeckSyncEntry, DeckValidationResult, DraftClientMessage, DraftPickView, ExpansionSetInfo, FeedbackEntry, GameClientMessage, GameEndView, GameTypeView, GameView, GhostDeck, GhostOpponent, GithubSignInResult, ImportedDeck, InboxNote, Invite, InviteCheck, JobSpec, Leaderboard, ManaType, MatchView, MetaFormat, Payment, PlayerAction, PlayerEmote, PlayerLook, PlayerReport, Puzzle, PuzzleExport, QuickDraftRun, QuickDraftState, ReplayInfo, RoomUsersView, ServerInfo, ServerSettings, ServerState, ServerStats, SoloSave, SoloTable, SoloTurn, StaffList, StaffMe, StaffMember, StaffResetCode, StartOptions, SupportLedger, SupportStatus, SupportYou, TableClientMessage, TableView, TournamentTypeView, TournamentView, UpdateStatus, UserData, UserRequestMessage, UserView } from './views';
+ import type { ReplayPage, WebCardFilters, WebMatchOptions, WebTournamentOptions } from '../options';
+ 
+ export type UUID = string;
+@@ -234,6 +234,14 @@ export interface RpcMethods {
+   careerLimitedDeck: { params: [deck: DeckCardLists]; result: CareerLimitedRun };
+   careerLimitedPlay: { params: []; result: CareerMatch };
+   careerLimitedAbandon: { params: []; result: CareerLimitedRun };
++  quickDraft: { params: []; result: QuickDraftState };
++  quickDraftStart: { params: [setCode: string, brains?: string[] | null, pilot?: string | null, claudeSkill?: number | null]; result: QuickDraftRun };
++  quickDraftPick: { params: [index: number]; result: QuickDraftRun };
++  quickDraftCoach: { params: []; result: CareerLimitedCoach };
++  quickDraftDeck: { params: [deck: DeckCardLists]; result: QuickDraftRun };
++  quickDraftPilot: { params: [pilot: string, claudeSkill?: number | null]; result: QuickDraftRun };
++  quickDraftPlay: { params: []; result: CareerMatch };
++  quickDraftAbandon: { params: []; result: QuickDraftRun };
+   soloSaves: { params: []; result: SoloSave[] };
+   soloResume: { params: [saveId: string]; result: SoloTable };
+   soloDelete: { params: [saveId: string]; result: boolean };
+@@ -494,6 +502,14 @@ export const RPC_METHODS: { readonly [M in RpcMethodName]: { readonly access: Rp
+   careerLimitedDeck: { access: 'session', sessionParam: -1 },
+   careerLimitedPlay: { access: 'session', sessionParam: -1 },
+   careerLimitedAbandon: { access: 'session', sessionParam: -1 },
++  quickDraft: { access: 'session', sessionParam: -1 },
++  quickDraftStart: { access: 'session', sessionParam: -1 },
++  quickDraftPick: { access: 'session', sessionParam: -1 },
++  quickDraftCoach: { access: 'session', sessionParam: -1 },
++  quickDraftDeck: { access: 'session', sessionParam: -1 },
++  quickDraftPilot: { access: 'session', sessionParam: -1 },
++  quickDraftPlay: { access: 'session', sessionParam: -1 },
++  quickDraftAbandon: { access: 'session', sessionParam: -1 },
+   soloSaves: { access: 'session', sessionParam: -1 },
+   soloResume: { access: 'session', sessionParam: -1 },
+   soloDelete: { access: 'session', sessionParam: -1 },
+diff --git a/Mage.Web.Client/src/protocol/generated/views.ts b/Mage.Web.Client/src/protocol/generated/views.ts
+index 966312083a..b815ac7fb9 100644
+--- a/Mage.Web.Client/src/protocol/generated/views.ts
++++ b/Mage.Web.Client/src/protocol/generated/views.ts
+@@ -1921,6 +1921,53 @@ export interface PuzzleExport {
+     puzzle?: Puzzle;
+ }
+ 
++export interface QuickDraftBot {
++    brain?: string;
++    builtBy?: string;
++    cards?: CareerPoolCard[];
++    colors?: string;
++    name?: string;
++    seat?: number;
++}
++
++export interface QuickDraftBrain {
++    label?: string;
++    name?: string;
++}
++
++export interface QuickDraftGame {
++    brain?: string;
++    colors?: string;
++    ended?: number;
++    number?: number;
++    opponent?: string;
++    pilot?: string;
++    seat?: number;
++    tableId?: string;
++    turns?: number;
++    won?: boolean;
++}
++
++export interface QuickDraftRun extends CareerLimitedRun {
++    brains?: string[];
++    claudeSkill?: number;
++    games?: QuickDraftGame[];
++    next?: QuickDraftBot;
++    pilot?: string;
++    started?: number;
++    takenSince?: string[];
++    wheeled?: string[];
++}
++
++export interface QuickDraftState {
++    brainService?: boolean;
++    brains?: QuickDraftBrain[];
++    defaultBrain?: string;
++    recent?: QuickDraftRun[];
++    run?: QuickDraftRun;
++    sets?: string[];
++}
++
+ export interface ReplayInfo {
+     batchOwner?: string;
+     deckType?: string;

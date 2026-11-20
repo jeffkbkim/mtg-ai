@@ -1,0 +1,24 @@
+[project]
+name = "mtg-ai"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.3",
+    "torch>=2.14.1",
+]
+
+[dependency-groups]
+brain = [
+    "onnxruntime>=1.31.1",
+]
+data = [
+    "polars>=2.0.0",
+]
+dev = [
+    "matplotlib>=3.11.2",
+    "pytest>=9.1.1",
+    "tensorboard>=2.21.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
